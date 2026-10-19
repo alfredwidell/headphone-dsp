@@ -176,6 +176,31 @@ pub fn set_linux_virtual_sink_volume(percent: u8) {
     );
 }
 
+/// Ensure downstream hardware/sink mixers are pinned to unity (`100%` / `0 dB`)
+/// so `headphone_dsp_sink` (controlled by the desktop volume keys/slider) is
+/// the single volume control stage with zero hidden attenuation downstream.
+#[cfg(target_os = "linux")]
+pub fn maximize_linux_output_gains(playback_backend: &str, playback_device: &str) {
+    // 1. Hardware ALSA mixers on all sound cards (0..4): Master, Headphone, PCM, Front, DAC
+    for card in 0..4 {
+        for ctl in ["Master", "Headphone", "PCM", "Front", "DAC"] {
+            let _ = std::process::Command::new("amixer")
+                .args(["-c", &card.to_string(), "sset", ctl, "100%", "unmute"])
+                .output();
+        }
+    }
+    // 2. If outputting via a Pulse/PipeWire sink (not our virtual input sink),
+    // set that downstream sink to 100% unmuted so it doesn't double-attenuate.
+    if playback_backend.eq_ignore_ascii_case("pulse")
+        && !playback_device.trim().is_empty()
+        && playback_device.trim() != LINUX_VIRTUAL_SINK_NAME
+    {
+        let dev = playback_device.trim();
+        let _ = run_lines("pactl", &["set-sink-mute", dev, "0"]);
+        let _ = run_lines("pactl", &["set-sink-volume", dev, "100%"]);
+    }
+}
+
 /// Make sure the virtual null sink exists and return its monitor source.
 ///
 /// Loads `module-null-sink` if `headphone_dsp_sink` is missing, so any
@@ -183,12 +208,7 @@ pub fn set_linux_virtual_sink_volume(percent: u8) {
 /// do not persist across reboots, so this runs on every device refresh.
 #[cfg(target_os = "linux")]
 pub fn ensure_linux_virtual_sink() -> Result<String, String> {
-    // Ensure the hardware ALSA Headphone Playback Volume isn't stuck at a
-    // low mixer level when CamillaDSP outputs directly to ALSA (bypassing
-    // PipeWire's mixer).
-    let _ = std::process::Command::new("amixer")
-        .args(["-c", "1", "sset", "Headphone", "100%", "unmute"])
-        .output();
+    maximize_linux_output_gains("", "");
 
     let sinks = run_lines("pactl", &["list", "short", "sinks"])?;
     let exists = sinks

@@ -127,6 +127,11 @@ impl Core {
 
     /// Start CamillaDSP for the current settings (stopping any running instance).
     async fn launch(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        crate::devices::maximize_linux_output_gains(
+            &self.settings.playback_backend,
+            &self.settings.playback_device,
+        );
         let io = self.settings.io_config();
         validate_io(&io)?;
         let config = build_config(&io, &self.settings.dsp(), &self.store.runtime_dir())?;
