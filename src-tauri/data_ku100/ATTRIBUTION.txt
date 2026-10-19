@@ -1,0 +1,10 @@
+KU100-derived crossfeed FIR assets in this directory are adapted from the public
+TH Köln / Institute of Communications Engineering Neumann KU100 HRIR dataset.
+
+Source references:
+- https://sofacoustics.org/data/database/fhk/
+- https://zenodo.org/records/4297951
+
+The runtime assets in this repository are simplified horizontal-plane derivatives
+prepared for local crossfeed experiments. Preserve attribution to the original
+dataset authors when redistributing derived data.
