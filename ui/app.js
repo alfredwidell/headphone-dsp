@@ -59,7 +59,7 @@
   }, { passive: false });
   const defaults = {
     capture_backend:'Pulse', capture_device:'headphone_dsp_sink.monitor', capture_loopback:true,
-    playback_backend:'Alsa', playback_device:'plughw:CARD=Generic_1,DEV=0', exclusive_mode:false,
+    playback_backend:'Alsa', playback_device:'plughw:CARD=Generic_1,DEV=0', exclusive_mode:false, hw_volume_bypass:false,
     sample_rate:48000, chunksize:2048, master_bypass:false, preamp_db:0, auto_preamp:true,
     crossfeed_enabled:true, crossfeed_angle_deg:35, crossfeed_mid_boost_db:3, eq_enabled:true,
     eq_bands:[{enabled:true,band_type:'low_shelf',freq_hz:105,gain_db:4,q:.71}, {enabled:true,band_type:'bell',freq_hz:1000,gain_db:0,q:1}, {enabled:true,band_type:'high_shelf',freq_hz:8000,gain_db:-1.5,q:.71}], active_profile:'Default'
@@ -246,6 +246,7 @@
     $('mid-value').innerHTML=`${settings.crossfeed_mid_boost_db.toFixed(1)} <span>dB</span>`;
     $('preamp-value').innerHTML=`${signed(settings.preamp_db)} <span>dB</span>`;
     $('bypass').setAttribute('aria-pressed',String(settings.master_bypass)); $('bypass-label').textContent=settings.master_bypass?'Original signal':'DSP active';
+    $('hw-vol').setAttribute('aria-pressed',String(!!settings.hw_volume_bypass)); $('hw-vol-label').textContent=settings.hw_volume_bypass?'Fixed 0 dB':'OS Vol';
     $('bypass-overlay').hidden=!settings.master_bypass;
     $('auto-label').textContent=settings.auto_preamp?'Auto-preamp on':'Manual gain · anti-clip off';
     $('headroom-status').textContent=settings.auto_preamp?'ANTI-CLIP':'MANUAL';
@@ -408,6 +409,7 @@
   });
   [['crossfeed-enabled','crossfeed_enabled'],['eq-enabled','eq_enabled'],['auto-preamp','auto_preamp'],['exclusive','exclusive_mode']].forEach(([id,key])=>$(id).addEventListener('change',event=>{settings[key]=event.target.checked;edited();}));
   $('bypass').addEventListener('click',()=>{settings.master_bypass=!settings.master_bypass;edited();});
+  $('hw-vol').addEventListener('click',()=>{settings.hw_volume_bypass=!settings.hw_volume_bypass;edited();toast(settings.hw_volume_bypass?'Hardware volume mode: OS volume locked to 100% (0 dB).':'OS software volume control restored.');});
   $('angle-presets').addEventListener('click',event=>{const button=event.target.closest('[data-angle]');if(button){settings.crossfeed_angle_deg=Number(button.dataset.angle);setRange('angle',settings.crossfeed_angle_deg);edited();}});
   [['sample-rate','sample_rate'],['chunksize','chunksize']].forEach(([id,key])=>$(id).addEventListener('change',event=>{settings[key]=Number(event.target.value);edited();}));
   ['capture','playback'].forEach(direction=>$(direction).addEventListener('change',event=>{

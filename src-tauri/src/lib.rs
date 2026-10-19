@@ -81,10 +81,28 @@ fn is_virtual(device: &AudioDeviceInfo) -> bool {
 impl Core {
     fn save(&mut self) -> Result<(), String> {
         #[cfg(target_os = "linux")]
-        if let Some(vol) = crate::devices::read_linux_virtual_sink_volume() {
-            self.settings.virtual_sink_volume = Some(vol);
+        if !self.settings.hw_volume_bypass {
+            if let Some(vol) = crate::devices::read_linux_virtual_sink_volume() {
+                self.settings.virtual_sink_volume = Some(vol);
+            }
         }
         self.store.save_settings(&self.settings)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn apply_volume_mode(&mut self, was_bypass: bool) {
+        if self.settings.hw_volume_bypass {
+            if !was_bypass {
+                if let Some(vol) = crate::devices::read_linux_virtual_sink_volume() {
+                    self.settings.virtual_sink_volume = Some(vol);
+                }
+            }
+            crate::devices::set_linux_virtual_sink_volume(100);
+        } else if was_bypass {
+            if let Some(vol) = self.settings.virtual_sink_volume {
+                crate::devices::set_linux_virtual_sink_volume(vol);
+            }
+        }
     }
 
     /// First-run defaults: fill empty device selections from the scan.
@@ -128,10 +146,15 @@ impl Core {
     /// Start CamillaDSP for the current settings (stopping any running instance).
     async fn launch(&mut self) -> Result<(), String> {
         #[cfg(target_os = "linux")]
-        crate::devices::maximize_linux_output_gains(
-            &self.settings.playback_backend,
-            &self.settings.playback_device,
-        );
+        {
+            crate::devices::maximize_linux_output_gains(
+                &self.settings.playback_backend,
+                &self.settings.playback_device,
+            );
+            if self.settings.hw_volume_bypass {
+                crate::devices::set_linux_virtual_sink_volume(100);
+            }
+        }
         let io = self.settings.io_config();
         validate_io(&io)?;
         let config = build_config(&io, &self.settings.dsp(), &self.store.runtime_dir())?;
@@ -196,7 +219,9 @@ async fn refresh_device_cache(state: &AppState) -> Result<(), String> {
     let list = scan_devices().await?;
     let mut core = state.core.lock().await;
     #[cfg(target_os = "linux")]
-    if first_scan {
+    if core.settings.hw_volume_bypass {
+        crate::devices::set_linux_virtual_sink_volume(100);
+    } else if first_scan {
         if let Some(vol) = core.settings.virtual_sink_volume {
             crate::devices::set_linux_virtual_sink_volume(vol);
         }
@@ -236,10 +261,14 @@ async fn update_dsp_settings(
 ) -> Result<AppStateResponse, String> {
     let mut core = state.core.lock().await;
     let prev_vol = core.settings.virtual_sink_volume;
+    #[allow(unused_variables)]
+    let was_bypass = core.settings.hw_volume_bypass;
     core.settings = settings.sanitized();
     if core.settings.virtual_sink_volume.is_none() {
         core.settings.virtual_sink_volume = prev_vol;
     }
+    #[cfg(target_os = "linux")]
+    core.apply_volume_mode(was_bypass);
     core.save()?;
     core.apply_to_engine().await?;
     Ok(core.view().await)
@@ -254,10 +283,14 @@ async fn start_engine(
 ) -> Result<AppStateResponse, String> {
     let mut core = state.core.lock().await;
     let prev_vol = core.settings.virtual_sink_volume;
+    #[allow(unused_variables)]
+    let was_bypass = core.settings.hw_volume_bypass;
     core.settings = settings.sanitized();
     if core.settings.virtual_sink_volume.is_none() {
         core.settings.virtual_sink_volume = prev_vol;
     }
+    #[cfg(target_os = "linux")]
+    core.apply_volume_mode(was_bypass);
     core.save()?;
     match core.engine.running_io() {
         Some(running) if running == core.settings.io_config() => core.hot_push().await?,
@@ -279,7 +312,11 @@ async fn stop_engine(state: tauri::State<'_, AppState>) -> Result<AppStateRespon
 async fn get_live_meters(state: tauri::State<'_, AppState>) -> Result<LiveMeters, String> {
     let mut core = state.core.lock().await;
     #[cfg(target_os = "linux")]
-    if let Some(vol) = crate::devices::read_linux_virtual_sink_volume() {
+    if core.settings.hw_volume_bypass {
+        if crate::devices::read_linux_virtual_sink_volume() != Some(100) {
+            crate::devices::set_linux_virtual_sink_volume(100);
+        }
+    } else if let Some(vol) = crate::devices::read_linux_virtual_sink_volume() {
         if core.settings.virtual_sink_volume != Some(vol) {
             core.settings.virtual_sink_volume = Some(vol);
             let _ = core.store.save_settings(&core.settings);

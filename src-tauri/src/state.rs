@@ -114,6 +114,8 @@ pub struct AppSettings {
     pub playback_backend: String,
     pub playback_device: String,
     pub exclusive_mode: bool,
+    #[serde(default)]
+    pub hw_volume_bypass: bool,
     pub sample_rate: u32,
     #[serde(alias = "chunk_size")]
     pub chunksize: usize,
@@ -140,6 +142,7 @@ impl Default for AppSettings {
             playback_backend: BACKEND_ALSA.to_string(),
             playback_device: String::new(),
             exclusive_mode: false,
+            hw_volume_bypass: false,
             sample_rate: DEFAULT_SAMPLE_RATE,
             chunksize: DEFAULT_CHUNKSIZE,
             master_bypass: dsp.master_bypass,
@@ -171,6 +174,7 @@ impl AppSettings {
                 .unwrap_or_else(|| self.playback_backend.trim().to_string()),
             playback_device: self.playback_device.trim().to_string(),
             exclusive_mode: self.exclusive_mode,
+            hw_volume_bypass: self.hw_volume_bypass,
             sample_rate: self.sample_rate,
             chunksize: self.chunksize.clamp(CHUNKSIZE_MIN, CHUNKSIZE_MAX),
             master_bypass: dsp.master_bypass,
