@@ -317,6 +317,20 @@ async fn export_autoeq(state: tauri::State<'_, AppState>) -> Result<ExportAutoEq
     })
 }
 
+/// Set the native webview zoom factor (`0.5` .. `3.0`).
+#[tauri::command]
+fn set_webview_zoom(zoom: f64, window: tauri::WebviewWindow) -> Result<f64, String> {
+    let clamped = if zoom.is_finite() {
+        zoom.clamp(0.5, 3.0)
+    } else {
+        1.0
+    };
+    window
+        .set_zoom(clamped)
+        .map_err(|e| format!("setting webview zoom: {e}"))?;
+    Ok(clamped)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -350,6 +364,7 @@ pub fn run() {
             delete_profile,
             import_autoeq,
             export_autoeq,
+            set_webview_zoom,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Headphone DSP");

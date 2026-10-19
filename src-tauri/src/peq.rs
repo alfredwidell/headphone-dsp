@@ -254,7 +254,7 @@ pub fn compute_peq_response(
 
     let raw_peak_db = sum_db.iter().copied().fold(0.0f64, f64::max);
     let effective_preamp_db = if auto_preamp {
-        (-raw_peak_db - 0.5).min(0.0) + preamp_db
+        (-raw_peak_db).min(0.0) + preamp_db
     } else {
         preamp_db
     };
@@ -515,7 +515,7 @@ mod tests {
         let resp = compute_peq_response(&bands, 0.0, true, FS, true);
         assert_eq!(resp.freq_hz.len(), CURVE_POINTS);
         assert!((resp.raw_peak_db - 6.0).abs() < 0.05);
-        assert!((resp.effective_preamp_db + 6.5).abs() < 0.05);
+        assert!((resp.effective_preamp_db + 6.0).abs() < 0.05);
         assert_eq!(resp.per_band_db.len(), 1);
 
         let manual = compute_peq_response(&bands, -2.0, false, FS, true);

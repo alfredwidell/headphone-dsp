@@ -12,6 +12,51 @@
   const types = {bell:'Bell / Peaking', low_shelf:'Low shelf', high_shelf:'High shelf', high_pass:'High pass', low_pass:'Low pass', notch:'Notch'};
   const gainTypes = new Set(['bell', 'low_shelf', 'high_shelf']);
   const previewMode = !window.__TAURI__?.core?.invoke;
+  const zoomStorageKey = 'headphone-dsp.ui-zoom.v1';
+  let uiZoom = 1, zoomQueue = Promise.resolve(), zoomRevision = 0;
+
+  function setUIZoom(value, persist = true) {
+    if (!Number.isFinite(value)) value = 1;
+    uiZoom = Math.round(clamp(value, .7, 2) * 100) / 100;
+    $('zoom-reset').textContent = `${Math.round(uiZoom * 100)}%`;
+    $('zoom-out').disabled = uiZoom <= .7;
+    $('zoom-in').disabled = uiZoom >= 2;
+    if (persist) {
+      try { localStorage.setItem(zoomStorageKey, String(uiZoom)); } catch { /* Zoom still works without storage. */ }
+    }
+    if (previewMode) {
+      document.documentElement.style.zoom = String(uiZoom);
+    } else {
+      const zoom = uiZoom, expected = ++zoomRevision;
+      // Serialize native calls and coalesce waiting wheel events so older zoom
+      // requests cannot complete after, and replace, the latest choice.
+      zoomQueue = zoomQueue.then(async () => {
+        if (expected !== zoomRevision) return;
+        await window.__TAURI__.core.invoke('set_webview_zoom', { zoom });
+      }).catch(error => toast(`UI zoom could not be applied: ${error?.message || String(error)}`, 'error'));
+    }
+  }
+
+  $('zoom-out').addEventListener('click', () => setUIZoom(uiZoom - .1));
+  $('zoom-in').addEventListener('click', () => setUIZoom(uiZoom + .1));
+  $('zoom-reset').addEventListener('click', () => setUIZoom(1));
+  window.addEventListener('keydown', event => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    let next;
+    if (event.key === '+' || event.key === '=' || event.code === 'NumpadAdd') next = uiZoom + .1;
+    else if (event.key === '-' || event.key === '_' || event.code === 'NumpadSubtract') next = uiZoom - .1;
+    else if (event.key === '0' || event.code === 'Numpad0') next = 1;
+    else return;
+    event.preventDefault();
+    setUIZoom(next);
+  }, { passive: false });
+  window.addEventListener('wheel', event => {
+    if (!(event.ctrlKey || event.metaKey) || event.target.closest?.('[data-handle]')) return;
+    event.preventDefault();
+    if (!event.deltaY) return;
+    const pixels = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? window.innerHeight : 1);
+    setUIZoom(uiZoom + clamp(-pixels * .001, -.1, .1));
+  }, { passive: false });
   const defaults = {
     capture_backend:'Pulse', capture_device:'headphone_dsp_sink.monitor', capture_loopback:true,
     playback_backend:'Alsa', playback_device:'plughw:CARD=Generic_1,DEV=0', exclusive_mode:false,
@@ -68,7 +113,7 @@
     });
     const composite_db = freq_hz.map((_,i) => s.eq_enabled ? per_band_db.reduce((sum,values) => sum+values[i],0) : 0);
     const raw_peak_db = Math.max(0,...composite_db);
-    const effective_preamp_db = s.master_bypass ? 0 : s.preamp_db - (s.auto_preamp ? Math.max(0,raw_peak_db + .5) : 0);
+    const effective_preamp_db = s.master_bypass ? 0 : s.preamp_db - (s.auto_preamp ? Math.max(0,raw_peak_db) : 0);
     return {freq_hz,per_band_db,composite_db,raw_peak_db,effective_preamp_db};
   }
   function computeCrossfeed(s) {
@@ -230,9 +275,9 @@
     if(!preview?.freq_hz?.length) return;
     const ticks=[20,50,100,200,500,1000,2000,5000,10000,20000], levels=[-18,-12,-6,0,6,12,18];
     let html='<defs><linearGradient id="eq-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#b98af0" stop-opacity=".2"/><stop offset="100%" stop-color="#b98af0" stop-opacity=".015"/></linearGradient><clipPath id="plot-clip"><rect x="45" y="15" width="733" height="252"/></clipPath></defs>';
-    levels.forEach(db=>{const y=gy(db);html+=`<line x1="45" x2="778" y1="${y}" y2="${y}" stroke="${db===0?'#83899775':'#ffffff09'}" ${db===0?'stroke-dasharray="3 5"':''}/><text x="33" y="${y+3}" text-anchor="end" fill="#838997" font-size="9">${db>0?'+':''}${db}</text>`;});
-    ticks.forEach(f=>{const x=gx(f);html+=`<line x1="${x}" x2="${x}" y1="15" y2="267" stroke="#ffffff08"/><text x="${x}" y="287" text-anchor="middle" fill="#838997" font-size="9">${f>=1000?`${f/1000}k`:f}</text>`;});
-    html+='<text x="14" y="7" fill="#838997" font-size="8">dB</text><g clip-path="url(#plot-clip)">';
+    levels.forEach(db=>{const y=gy(db);html+=`<line x1="45" x2="778" y1="${y}" y2="${y}" stroke="${db===0?'#83899775':'#ffffff09'}" ${db===0?'stroke-dasharray="3 5"':''}/><text x="33" y="${y+3}" text-anchor="end" fill="#838997" font-size="11">${db>0?'+':''}${db}</text>`;});
+    ticks.forEach(f=>{const x=gx(f);html+=`<line x1="${x}" x2="${x}" y1="15" y2="267" stroke="#ffffff08"/><text x="${x}" y="287" text-anchor="middle" fill="#838997" font-size="11">${f>=1000?`${f/1000}k`:f}</text>`;});
+    html+='<text x="14" y="7" fill="#838997" font-size="11">dB</text><g clip-path="url(#plot-clip)">';
     const compositePath=pathFor(preview.freq_hz,preview.composite_db);
     html+=`<path d="${compositePath} L${gx(20000)},${gy(0)} L${gx(20)},${gy(0)} Z" fill="url(#eq-fill)"/>`;
     (preview.per_band_db||[]).forEach((values,i)=>{if(settings.eq_bands[i]?.enabled && settings.eq_enabled) html+=`<path d="${pathFor(preview.freq_hz,values)}" fill="none" stroke="${colors[i]}" stroke-width="1.15" opacity="${selectedBand===i?.7:.3}"/>`;});
@@ -240,7 +285,7 @@
     settings.eq_bands.forEach((b,i)=>{
       if(!b.enabled) return;
       const y=gy(gainTypes.has(b.band_type)?b.gain_db:0),x=gx(b.freq_hz);
-      html+=`<g class="handle" data-handle="${i}" opacity="${settings.eq_enabled?1:.4}"><circle cx="${x}" cy="${y}" r="19" fill="transparent"/>${selectedBand===i?`<circle cx="${x}" cy="${y}" r="14" fill="${colors[i]}" opacity=".12"/>`:''}<circle cx="${x}" cy="${y}" r="9" fill="#171b22" stroke="${colors[i]}" stroke-width="1.5"/><text x="${x}" y="${y+3}" text-anchor="middle" fill="${colors[i]}" font-size="9" pointer-events="none">${i+1}</text></g>`;
+      html+=`<g class="handle" data-handle="${i}" opacity="${settings.eq_enabled?1:.4}"><circle cx="${x}" cy="${y}" r="19" fill="transparent"/>${selectedBand===i?`<circle cx="${x}" cy="${y}" r="14" fill="${colors[i]}" opacity=".12"/>`:''}<circle cx="${x}" cy="${y}" r="9" fill="#171b22" stroke="${colors[i]}" stroke-width="1.5"/><text x="${x}" y="${y+3}" text-anchor="middle" fill="${colors[i]}" font-size="11" pointer-events="none">${i+1}</text></g>`;
     });
     $('eq-graph').innerHTML=html;
     $('peak').innerHTML=`${signed(preview.raw_peak_db||0)} <small>dB</small>`;
@@ -256,9 +301,9 @@
     if(!preview?.freq_hz?.length) return;
     const x=f=>25+Math.log10(f/20)/3*300, y=db=>clamp(70-db*2.2,4,84);
     let html='';
-    [-12,0,12,24].forEach(db=>html+=`<line x1="25" x2="325" y1="${y(db)}" y2="${y(db)}" stroke="#ffffff0c"/><text x="19" y="${y(db)+3}" text-anchor="end" font-size="7" fill="#838997">${db}</text>`);
+    [-12,0,12,24].forEach(db=>html+=`<line x1="25" x2="325" y1="${y(db)}" y2="${y(db)}" stroke="#ffffff0c"/><text x="19" y="${y(db)+3}" text-anchor="end" font-size="11" fill="#838997">${db}</text>`);
     [[preview.mid_db,'#b98af0'],[preview.side_db,'#7dd3c8'],[preview.ild_db,'#e8b34b']].forEach(([values,color])=>html+=`<path d="${pathFor(preview.freq_hz,values,x,y)}" fill="none" stroke="${color}" stroke-width="1.5"/>`);
-    [20,1000,20000].forEach(f=>html+=`<text x="${x(f)}" y="98" text-anchor="middle" fill="#838997" font-size="7">${f>=1000?f/1000+'k':f}</text>`);
+    [20,1000,20000].forEach(f=>html+=`<text x="${x(f)}" y="98" text-anchor="middle" fill="#838997" font-size="11">${f>=1000?f/1000+'k':f}</text>`);
     $('cross-chart').innerHTML=html;
   }
   function drawLocal() { renderEQ(computePEQ(settings)); renderStage(); renderCross(computeCrossfeed(settings)); }
@@ -488,6 +533,12 @@
   window.addEventListener('pageshow',()=>{if(ready && state.meters?.running && !pollTimer)startPolling();});
 
   async function init() {
+    let savedZoom = 1;
+    try {
+      const stored = localStorage.getItem(zoomStorageKey);
+      if (stored !== null && stored.trim() !== '') savedZoom = Number(stored);
+    } catch { /* Use 100% when storage is unavailable. */ }
+    setUIZoom(savedZoom, false);
     $('preview-badge').hidden=!previewMode;
     if(previewMode) {
       $('footer-mode').textContent='BROWSER PREVIEW · SIMULATED METERS · NO AUDIO';

@@ -155,6 +155,13 @@ fn pactl_short_name(line: &str) -> Option<&str> {
 /// do not persist across reboots, so this runs on every device refresh.
 #[cfg(target_os = "linux")]
 pub fn ensure_linux_virtual_sink() -> Result<String, String> {
+    // Also ensure the hardware ALSA Headphone Playback Volume isn't stuck at a
+    // low mixer level when CamillaDSP outputs directly to ALSA (bypassing
+    // PipeWire's mixer).
+    let _ = std::process::Command::new("amixer")
+        .args(["-c", "1", "sset", "Headphone", "100%", "unmute"])
+        .output();
+
     let sinks = run_lines("pactl", &["list", "short", "sinks"])?;
     let exists = sinks
         .iter()
@@ -167,6 +174,8 @@ pub fn ensure_linux_virtual_sink() -> Result<String, String> {
             &["load-module", "module-null-sink", &sink_name_arg, &sink_properties_arg],
         )?;
     }
+    let _ = run_lines("pactl", &["set-sink-mute", LINUX_VIRTUAL_SINK_NAME, "0"]);
+    let _ = run_lines("pactl", &["set-sink-volume", LINUX_VIRTUAL_SINK_NAME, "100%"]);
     Ok(LINUX_VIRTUAL_SINK_MONITOR.to_string())
 }
 
