@@ -92,7 +92,12 @@ impl Core {
             return false;
         };
         let mut changed = false;
-        if self.settings.capture_device.trim().is_empty() {
+        let capture_valid = !self.settings.capture_device.trim().is_empty()
+            && devices
+                .capture
+                .iter()
+                .any(|d| d.id == self.settings.capture_device);
+        if !capture_valid {
             let pick = devices
                 .capture
                 .iter()

@@ -143,7 +143,7 @@
     return {running:mockRunning,state:mockRunning?'Running':'Stopped',capture_peak:input,playback_peak:output,capture_rms:input.map(v=>v-8),playback_rms:output.map(v=>v-8),load_percent:mockRunning?2.4+Math.sin(Date.now()/1500)*.5:0,clipped_samples:mockClips,error:null};
   }
   function mockResponse() {
-    return {settings:clone(mockSettings),capture_devices:[{id:'headphone_dsp_sink.monitor',label:'[Virtual Sink Loopback] Headphone DSP Virtual Input',backend:'Pulse',is_loopback:true,channels:2},{id:'default',label:'System microphone (not loopback)',backend:'Pulse',is_loopback:false,channels:2}],playback_devices:[{id:'plughw:CARD=Generic_1,DEV=0',label:'ALC257 Analog (ALSA Direct)',backend:'Alsa',is_loopback:false,channels:2},{id:'default',label:'System default output',backend:'Pulse',is_loopback:false,channels:2}],profiles:Object.keys(mockProfiles),peq_preview:computePEQ(mockSettings),crossfeed_preview:computeCrossfeed(mockSettings),meters:mockMeters()};
+    return {settings:clone(mockSettings),capture_devices:[{id:'headphone_dsp_sink.monitor',label:'[Virtual Sink Loopback] Headphone DSP Virtual Input',backend:'Pulse',is_loopback:true,channels:2}],playback_devices:[{id:'plughw:CARD=Generic_1,DEV=0',label:'ALC257 Analog (ALSA Direct)',backend:'Alsa',is_loopback:false,channels:2},{id:'default',label:'System default output',backend:'Pulse',is_loopback:false,channels:2}],profiles:Object.keys(mockProfiles),peq_preview:computePEQ(mockSettings),crossfeed_preview:computeCrossfeed(mockSettings),meters:mockMeters()};
   }
   function persistProfiles() {
     try { localStorage.setItem(storageKey,JSON.stringify(mockProfiles)); }
@@ -214,7 +214,16 @@
     select.value=value;
   }
   function renderDevices() {
-    selectDevices('capture',state.capture_devices||[],settings.capture_device);
+    const caps=state.capture_devices||[];
+    const singleCapture=caps.length===1;
+    if(singleCapture && settings.capture_device!==caps[0].id) {
+      settings.capture_device=caps[0].id;
+      settings.capture_backend=caps[0].backend;
+      settings.capture_loopback=caps[0].is_loopback;
+    }
+    $('capture-wrap').hidden=singleCapture;
+    $('capture-arrow').hidden=singleCapture;
+    selectDevices('capture',caps,settings.capture_device);
     selectDevices('playback',state.playback_devices||[],settings.playback_device);
   }
   function renderProfiles() {

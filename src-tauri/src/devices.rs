@@ -409,9 +409,26 @@ fn enumerate_linux(list: &mut DeviceList) {
         }
     }
 
-    // Hardware ALSA devices (CamillaDSP `type: Alsa`).
+    // Hardware ALSA playback devices (CamillaDSP `type: Alsa`).
     list.playback.extend(alsa_devices("aplay"));
-    list.capture.extend(alsa_devices("arecord"));
+
+    // When the dedicated virtual loopback sink is available on Linux, it is the
+    // single authoritative capture source — omit microphones and hardware
+    // monitor sources so the UI does not need a capture dropdown at all.
+    if list.virtual_sink.is_some() {
+        list.capture.retain(|d| d.id == LINUX_VIRTUAL_SINK_MONITOR);
+        if list.capture.is_empty() {
+            list.capture.push(AudioDeviceInfo {
+                id: LINUX_VIRTUAL_SINK_MONITOR.to_string(),
+                label: VIRTUAL_SINK_LABEL.to_string(),
+                backend: BACKEND_PULSE.to_string(),
+                is_loopback: true,
+                channels: 2,
+            });
+        }
+    } else {
+        list.capture.extend(alsa_devices("arecord"));
+    }
 }
 
 #[cfg(test)]
