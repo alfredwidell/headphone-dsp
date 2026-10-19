@@ -126,6 +126,8 @@ pub struct AppSettings {
     pub eq_enabled: bool,
     pub eq_bands: Vec<EqBand>,
     pub active_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_sink_volume: Option<u8>,
 }
 
 impl Default for AppSettings {
@@ -149,6 +151,7 @@ impl Default for AppSettings {
             eq_enabled: dsp.eq_enabled,
             eq_bands: dsp.eq_bands,
             active_profile: DEFAULT_ACTIVE_PROFILE.to_string(),
+            virtual_sink_volume: None,
         }
     }
 }
@@ -179,6 +182,7 @@ impl AppSettings {
             eq_enabled: dsp.eq_enabled,
             eq_bands: dsp.eq_bands,
             active_profile: self.active_profile.trim().to_string(),
+            virtual_sink_volume: self.virtual_sink_volume.map(|v| v.min(150)),
         };
         if out.active_profile.is_empty() {
             out.active_profile = DEFAULT_ACTIVE_PROFILE.to_string();

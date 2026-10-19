@@ -79,7 +79,11 @@ fn is_virtual(device: &AudioDeviceInfo) -> bool {
 }
 
 impl Core {
-    fn save(&self) -> Result<(), String> {
+    fn save(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        if let Some(vol) = crate::devices::read_linux_virtual_sink_volume() {
+            self.settings.virtual_sink_volume = Some(vol);
+        }
         self.store.save_settings(&self.settings)
     }
 
@@ -183,8 +187,15 @@ async fn scan_devices() -> Result<DeviceList, String> {
 
 /// Scan devices and cache them, then apply first-run defaults.
 async fn refresh_device_cache(state: &AppState) -> Result<(), String> {
+    let first_scan = state.core.lock().await.devices.is_none();
     let list = scan_devices().await?;
     let mut core = state.core.lock().await;
+    #[cfg(target_os = "linux")]
+    if first_scan {
+        if let Some(vol) = core.settings.virtual_sink_volume {
+            crate::devices::set_linux_virtual_sink_volume(vol);
+        }
+    }
     core.devices = Some(list);
     if core.ensure_device_defaults() {
         core.save()?;
@@ -219,7 +230,11 @@ async fn update_dsp_settings(
     state: tauri::State<'_, AppState>,
 ) -> Result<AppStateResponse, String> {
     let mut core = state.core.lock().await;
+    let prev_vol = core.settings.virtual_sink_volume;
     core.settings = settings.sanitized();
+    if core.settings.virtual_sink_volume.is_none() {
+        core.settings.virtual_sink_volume = prev_vol;
+    }
     core.save()?;
     core.apply_to_engine().await?;
     Ok(core.view().await)
@@ -233,7 +248,11 @@ async fn start_engine(
     state: tauri::State<'_, AppState>,
 ) -> Result<AppStateResponse, String> {
     let mut core = state.core.lock().await;
+    let prev_vol = core.settings.virtual_sink_volume;
     core.settings = settings.sanitized();
+    if core.settings.virtual_sink_volume.is_none() {
+        core.settings.virtual_sink_volume = prev_vol;
+    }
     core.save()?;
     match core.engine.running_io() {
         Some(running) if running == core.settings.io_config() => core.hot_push().await?,
@@ -246,6 +265,7 @@ async fn start_engine(
 async fn stop_engine(state: tauri::State<'_, AppState>) -> Result<AppStateResponse, String> {
     let mut core = state.core.lock().await;
     core.engine.stop().await;
+    let _ = core.save();
     Ok(core.view().await)
 }
 
@@ -253,6 +273,13 @@ async fn stop_engine(state: tauri::State<'_, AppState>) -> Result<AppStateRespon
 #[tauri::command]
 async fn get_live_meters(state: tauri::State<'_, AppState>) -> Result<LiveMeters, String> {
     let mut core = state.core.lock().await;
+    #[cfg(target_os = "linux")]
+    if let Some(vol) = crate::devices::read_linux_virtual_sink_volume() {
+        if core.settings.virtual_sink_volume != Some(vol) {
+            core.settings.virtual_sink_volume = Some(vol);
+            let _ = core.store.save_settings(&core.settings);
+        }
+    }
     Ok(core.engine.meters().await)
 }
 
@@ -378,7 +405,9 @@ pub fn run() {
         if let RunEvent::Exit = event {
             let state = app_handle.state::<AppState>();
             tauri::async_runtime::block_on(async {
-                state.core.lock().await.engine.stop().await;
+                let mut core = state.core.lock().await;
+                let _ = core.save();
+                core.engine.stop().await;
             });
         }
     });

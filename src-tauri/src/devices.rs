@@ -148,6 +148,34 @@ fn pactl_short_name(line: &str) -> Option<&str> {
     line.split('\t').nth(1).map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// Read the current volume percentage (`0..=150`) of `headphone_dsp_sink`.
+#[cfg(target_os = "linux")]
+pub fn read_linux_virtual_sink_volume() -> Option<u8> {
+    let lines = run_lines("pactl", &["get-sink-volume", LINUX_VIRTUAL_SINK_NAME]).ok()?;
+    for line in lines {
+        for part in line.split('/') {
+            let trimmed = part.trim();
+            if let Some(num) = trimmed.strip_suffix('%') {
+                if let Ok(pct) = num.trim().parse::<u16>() {
+                    return Some(pct.min(150) as u8);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Apply a saved volume percentage to `headphone_dsp_sink`.
+#[cfg(target_os = "linux")]
+pub fn set_linux_virtual_sink_volume(percent: u8) {
+    let pct = percent.clamp(0, 150);
+    let _ = run_lines("pactl", &["set-sink-mute", LINUX_VIRTUAL_SINK_NAME, "0"]);
+    let _ = run_lines(
+        "pactl",
+        &["set-sink-volume", LINUX_VIRTUAL_SINK_NAME, &format!("{pct}%")],
+    );
+}
+
 /// Make sure the virtual null sink exists and return its monitor source.
 ///
 /// Loads `module-null-sink` if `headphone_dsp_sink` is missing, so any
@@ -155,7 +183,7 @@ fn pactl_short_name(line: &str) -> Option<&str> {
 /// do not persist across reboots, so this runs on every device refresh.
 #[cfg(target_os = "linux")]
 pub fn ensure_linux_virtual_sink() -> Result<String, String> {
-    // Also ensure the hardware ALSA Headphone Playback Volume isn't stuck at a
+    // Ensure the hardware ALSA Headphone Playback Volume isn't stuck at a
     // low mixer level when CamillaDSP outputs directly to ALSA (bypassing
     // PipeWire's mixer).
     let _ = std::process::Command::new("amixer")
@@ -173,9 +201,8 @@ pub fn ensure_linux_virtual_sink() -> Result<String, String> {
             "pactl",
             &["load-module", "module-null-sink", &sink_name_arg, &sink_properties_arg],
         )?;
+        let _ = run_lines("pactl", &["set-sink-mute", LINUX_VIRTUAL_SINK_NAME, "0"]);
     }
-    let _ = run_lines("pactl", &["set-sink-mute", LINUX_VIRTUAL_SINK_NAME, "0"]);
-    let _ = run_lines("pactl", &["set-sink-volume", LINUX_VIRTUAL_SINK_NAME, "100%"]);
     Ok(LINUX_VIRTUAL_SINK_MONITOR.to_string())
 }
 
