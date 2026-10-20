@@ -6,7 +6,7 @@ This document provides the complete technical context for continuing work on **`
 
 ## 1. Project Overview
 
-`headphone-dsp` is a standalone desktop **Crossfeed + Parametric EQ** headphone processor for **Linux** and **Windows**, built with **Tauri v2 (Rust)** and an embedded **CamillaDSP 4.1.3** sidecar engine.
+`headphone-dsp` is a standalone desktop **Crossfeed + 10-Band Graphic EQ** headphone processor for **Linux** and **Windows**, built with **Tauri v2 (Rust)** and an embedded **CamillaDSP 4.1.3** sidecar engine.
 
 - **Repository:** `/home/alfredw/dev/headphone-dsp` (`https://github.com/alfredwidell/headphone-dsp.git`, branch `main`)
 - **Related repository:** `/home/alfredw/dev/hifi` (the origin of the Neumann KU100 Mid/Side crossfeed algorithm in `core/hifi_core/crossfeed.py` and the dark purple UI styling)
@@ -62,27 +62,36 @@ headphone-dsp/
 - **Stage order:**
   1. `preamp_gain` (`type: Gain`, channels `[0, 1]`) — omitted when `|effective_preamp_db| <= 1e-3` or `master_bypass == true`.
   2. Literal Mid/Side Crossfeed (`crossfeed_to_mid_side` mixer at `-6.0206 dB` → `crossfeed_mid_filter` on ch 0 & `crossfeed_side_filter` on ch 1 → `crossfeed_from_mid_side` mixer) — omitted when `!crossfeed_enabled || master_bypass`.
-  3. Parametric EQ (`parametric_eq_band_0..N`, `type: Biquad` with `Peaking`, `Lowshelf`, `Highshelf`, `Highpass`, `Lowpass`, `Notch`).
-     - **Important CamillaDSP 4.1.3 rule:** CamillaDSP rejects a single `Filter` pipeline step if `channels` contains duplicate indices, and we emit a single step `{"type": "Filter", "channels": [0, 1], "names": band_names}` applying all enabled bands to both channels.
+  3. 10-Band ISO Graphic EQ (`parametric_eq_band_0..9`, `type: Biquad` `Peaking` at `31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz`, `Q = 1.41`, `±6 dB` range).
+     - **Important CamillaDSP 4.1.3 rule:** CamillaDSP rejects a single `Filter` pipeline step if `channels` contains duplicate indices, and we emit a single step `{"type": "Filter", "channels": [0, 1], "names": band_names}` applying all 10 bands to both channels.
+     - **AutoEQ Import/Fitting (`src-tauri/src/peq.rs`):** 10-band AutoEQ `FixedBandEQ` presets map 1:1 on the fast path; arbitrary AutoEQ parametric presets (`LS`, `HS`, `PK`) and `GraphicEQ:` curves are fitted onto the 10 ISO bands via 4 rounds of regularized least squares.
 - **Hot-reload vs Restart:**
-  - When DSP parameters change (`crossfeed_*`, `eq_*`, `preamp_db`, `auto_preamp`, `master_bypass`) while the IO route (`capture`, `playback`, `sample_rate`, `chunksize`, `exclusive`) is unchanged, `Core::hot_push` regenerates the FIR files/config and sends `{"SetConfigJson": "<json>"}` over CamillaDSP's local WebSocket without interrupting audio.
+  - When DSP parameters change (`crossfeed_*`, `eq_*`, `master_bypass`) while the IO route (`capture`, `playback`, `sample_rate`, `chunksize`, `exclusive`) is unchanged, `Core::hot_push` regenerates the FIR files/config and sends `{"SetConfigJson": "<json>"}` over CamillaDSP's local WebSocket without interrupting audio.
   - When the IO route changes, `Core::launch` restarts the CamillaDSP child process on a fresh free local TCP port.
 
 ### 3.3 Audio Routing & Volume Architecture (`src-tauri/src/devices.rs`, `src-tauri/src/lib.rs`)
 - **Linux:**
   - On startup / device refresh, `ensure_linux_virtual_sink()` ensures the PipeWire/PulseAudio null sink `headphone_dsp_sink` (`description="Headphone_DSP_Virtual_Input"`) is loaded via `pactl`.
-  - When `headphone_dsp_sink` is active, `list.capture` contains **only** `headphone_dsp_sink.monitor` (`type: Pulse`), and the UI automatically hides the Capture dropdown (`#capture-wrap`) so the user only selects their **Headphone output / DAC**, **Sample rate**, and **Buffer**.
+  - When `headphone_dsp_sink` is active, `list.capture` contains **only** `headphone_dsp_sink.monitor` (`type: Pulse`), and the UI automatically hides the Capture dropdown (`#capture-wrap`) so the user only selects their **Headphone output / DAC**.
+  - **Automated Sample Rate, Resampling & Buffer (`DEFAULT_CHUNKSIZE = 512`):** Source sample rate (`44.1 kHz`, `48 kHz`, `88.2 kHz`, `96 kHz`, etc.) is detected automatically from the active source (`detect_source_sample_rate`: active sink-input streams / monitor source on Linux via `pactl`, or endpoint default config on Windows via `cpal`). Any higher source rate is mapped via `ku100_base_sample_rate()` to its integer-divisor KU100 base rate (`44.1 kHz` for `88.2/176.4/352.8 kHz`, `48 kHz` for `96/192/384 kHz`) and resampled by CamillaDSP (`capture_samplerate` + `resampler: {type: Synchronous}`), with a fixed `512`-sample low-latency buffer (`chunksize: 512`).
   - **Single-Volume-Control Guarantee:**
     - `maximize_linux_output_gains()` pins all hardware ALSA mixer controls (`Master`, `Headphone`, `PCM`, `Front`, `DAC` across cards `0..3`) and any selected downstream Pulse/PipeWire output sink to `100%` (`0.00 dB`, unmuted).
-    - `Auto-preamp` applies `min(-raw_peak_db, 0.0) + preamp_db` (`0.0 dB` when no positive EQ boost is active).
+    - `Auto-preamp` is always enabled (`auto_preamp = true`, `preamp_db = 0.0`) and integrated directly into the Graphic EQ toolbar (`Auto-preamp −X.X dB · Peak +X.X dB`), applying `min(-raw_peak_db, 0.0)` (`0.0 dB` when no positive EQ boost is active).
     - **OS Volume mode (`hw_volume_bypass == false`, default):** The user controls volume via the normal OS volume slider/keys on `Headphone DSP Virtual Input` (`headphone_dsp_sink`). Its level is tracked in `settings.virtual_sink_volume` (`~/.config/headphone-dsp/settings.json`) and restored on app startup.
     - **HW VOL Bypass mode (`hw_volume_bypass == true`, toggled via the header `HW VOL` button):** Saves the previous OS volume, then locks `headphone_dsp_sink` to `100%` (`0.00 dB`) — and re-enforces `100%` during `get_live_meters` polling — for external DACs/amps with their own hardware volume pot. Toggling `HW VOL` off restores the saved OS volume.
 - **Windows:**
   - Uses Option 1 — Zero-driver WASAPI Loopback: enumerates Windows output endpoints via `cpal` and exposes each as a capture option with `backend: "Wasapi"`, `is_loopback: true` (`loopback: true`, `format: "F32_LE"` in CamillaDSP) alongside standard WASAPI playback endpoints (`exclusive: bool` supported).
 
 ### 3.4 UI & Zoom (`ui/index.html`, `ui/style.css`, `ui/app.js`)
-- Base font size is `14px` with scrollable layout.
-- Supports **`Ctrl +` / `Ctrl −` / `Ctrl 0`**, **`Ctrl + Mousewheel`** (outside EQ handles), and the header **`− 100% +`** pill (`70%`–`200%`), persisted in `localStorage` (`headphone-dsp.ui-zoom.v1`) and applied via Tauri's native `WebviewWindow::set_zoom` (`set_webview_zoom` command).
+- **4-Group Top Header Bar (`.topbar`):**
+  1. `.brand` (`HEADPHONE DSP` title + subtitle, separated by right border)
+  2. `.routing-pod` (`OUTPUT / DAC` selector + `↻` refresh button)
+  3. `.meter-section` (`● Running <rate>` + stereo `L/R` output meter + `CLIP`)
+  4. `.engine-controls` (`DSP LOAD` + `HW VOL` + `A / B` + `Start/Stop DSP`)
+- **Graphic Equalizer Card (`#eq-card`):**
+  - Header integrates the `PROFILE` selector (`#profiles`, `Save as…`, `⌫`, `AutoEQ ↗` with clickable `autoeq.app` preset search link via `open_external_url`) and `Flat / Reset`.
+  - Compact `±12 dB` SVG frequency-response graph (`viewBox="0 0 800 136"`) above a 10-band studio vertical fader bank (`±6 dB` range, `184px` fader height).
+- **UI Zoom:** Supports **`Ctrl +` / `Ctrl −` / `Ctrl 0`** and **`Ctrl + Mousewheel`** (`70%`–`200%`), persisted in `localStorage` (`headphone-dsp.ui-zoom.v1`) and applied via Tauri's native `WebviewWindow::set_zoom` (`set_webview_zoom` command).
 
 ---
 

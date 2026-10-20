@@ -18,7 +18,7 @@ use crate::camilla::{build_config, sidecar_path, write_config_yaml, CamillaEngin
 use crate::crossfeed::CrossfeedPreview;
 use crate::devices::{enumerate_devices, AudioDeviceInfo, DeviceList, LINUX_VIRTUAL_SINK_MONITOR};
 use crate::peq::{export_autoeq as export_eq_text, parse_autoeq_text, PeqResponse};
-use crate::state::{compute_curves, AppSettings, IoConfig, Store, CUSTOM_PROFILE_LABEL};
+use crate::state::{compute_curves, AppSettings, IoConfig, Store, CUSTOM_PROFILE_LABEL, DEFAULT_CHUNKSIZE};
 
 const SAMPLE_RATE_MIN: u32 = 8_000;
 const SAMPLE_RATE_MAX: u32 = 384_000;
@@ -31,6 +31,8 @@ pub struct Core {
     settings: AppSettings,
     devices: Option<DeviceList>,
     engine: CamillaEngine,
+    /// Counts `get_live_meters` calls; drives the periodic sample-rate poll.
+    rate_poll_ticks: u8,
 }
 
 pub struct AppState {
@@ -193,7 +195,9 @@ impl Core {
     async fn view(&mut self) -> AppStateResponse {
         let dsp = self.settings.dsp();
         let (peq_preview, crossfeed_preview) = compute_curves(&dsp, self.settings.sample_rate);
-        let meters = self.engine.meters().await;
+        let mut meters = self.engine.meters().await;
+        meters.sample_rate = self.settings.sample_rate;
+        meters.chunksize = self.settings.chunksize;
         let devices = self.devices.clone().unwrap_or_default();
         AppStateResponse {
             settings: self.settings.clone(),
@@ -213,7 +217,22 @@ async fn scan_devices() -> Result<DeviceList, String> {
         .map_err(|e| format!("device enumeration failed: {e}"))
 }
 
-/// Scan devices and cache them, then apply first-run defaults.
+/// Capture and playback device ids: the route a detected sample rate applies to.
+fn route_of(settings: &AppSettings) -> (String, String) {
+    (settings.capture_device.clone(), settings.playback_device.clone())
+}
+
+/// Detect the active source's sample rate. Runs off the async runtime because
+/// it queries audio tools or the host API.
+async fn detect_rate_async(capture_device: String, playback_device: String) -> Option<u32> {
+    tokio::task::spawn_blocking(move || crate::devices::detect_source_sample_rate(&capture_device, &playback_device))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Scan devices and cache them, then apply first-run defaults and detect the
+/// sample rate of the selected route.
 async fn refresh_device_cache(state: &AppState) -> Result<(), String> {
     let first_scan = state.core.lock().await.devices.is_none();
     let list = scan_devices().await?;
@@ -227,7 +246,23 @@ async fn refresh_device_cache(state: &AppState) -> Result<(), String> {
         }
     }
     core.devices = Some(list);
-    if core.ensure_device_defaults() {
+    let mut changed = core.ensure_device_defaults();
+    let route = route_of(&core.settings);
+    drop(core);
+
+    let detected = detect_rate_async(route.0.clone(), route.1.clone()).await;
+    let mut core = state.core.lock().await;
+    if core.settings.chunksize != DEFAULT_CHUNKSIZE {
+        core.settings.chunksize = DEFAULT_CHUNKSIZE;
+        changed = true;
+    }
+    if let Some(rate) = detected.filter(|_| route_of(&core.settings) == route) {
+        if core.settings.sample_rate != rate {
+            core.settings.sample_rate = rate;
+            changed = true;
+        }
+    }
+    if changed {
         core.save()?;
     }
     Ok(())
@@ -253,7 +288,9 @@ async fn refresh_devices(state: tauri::State<'_, AppState>) -> Result<AppStateRe
 }
 
 /// Save the settings. A running engine is updated: a changed IO route
-/// restarts CamillaDSP, otherwise the DSP is hot-reloaded.
+/// restarts CamillaDSP, otherwise the DSP is hot-reloaded. The sample rate
+/// and chunk size are backend-owned: the values sent by the UI are ignored,
+/// and a changed capture or playback device re-detects the sample rate.
 #[tauri::command]
 async fn update_dsp_settings(
     settings: AppSettings,
@@ -263,19 +300,36 @@ async fn update_dsp_settings(
     let prev_vol = core.settings.virtual_sink_volume;
     #[allow(unused_variables)]
     let was_bypass = core.settings.hw_volume_bypass;
+    let prev_rate = core.settings.sample_rate;
+    let prev_route = route_of(&core.settings);
     core.settings = settings.sanitized();
+    core.settings.eq_bands = crate::peq::normalize_geq_bands(&core.settings.eq_bands);
+    core.settings.chunksize = DEFAULT_CHUNKSIZE;
+    core.settings.auto_preamp = true;
+    core.settings.preamp_db = 0.0;
+    core.settings.sample_rate = prev_rate;
     if core.settings.virtual_sink_volume.is_none() {
         core.settings.virtual_sink_volume = prev_vol;
     }
     #[cfg(target_os = "linux")]
     core.apply_volume_mode(was_bypass);
+    let route = route_of(&core.settings);
+    if route != prev_route {
+        drop(core);
+        let detected = detect_rate_async(route.0.clone(), route.1.clone()).await;
+        core = state.core.lock().await;
+        if let Some(rate) = detected.filter(|_| route_of(&core.settings) == route) {
+            core.settings.sample_rate = rate;
+        }
+    }
     core.save()?;
     core.apply_to_engine().await?;
     Ok(core.view().await)
 }
 
-/// Start CamillaDSP with these settings. If it is already running with the
-/// same IO route, the DSP settings are hot-reloaded instead.
+/// Start CamillaDSP with these settings. The sample rate is detected from the
+/// active source (falling back to the previous rate). If it is already running
+/// with the same IO route, the DSP settings are hot-reloaded instead.
 #[tauri::command]
 async fn start_engine(
     settings: AppSettings,
@@ -285,12 +339,28 @@ async fn start_engine(
     let prev_vol = core.settings.virtual_sink_volume;
     #[allow(unused_variables)]
     let was_bypass = core.settings.hw_volume_bypass;
+    let prev_rate = core.settings.sample_rate;
     core.settings = settings.sanitized();
+    core.settings.eq_bands = crate::peq::normalize_geq_bands(&core.settings.eq_bands);
+    core.settings.chunksize = DEFAULT_CHUNKSIZE;
+    core.settings.auto_preamp = true;
+    core.settings.preamp_db = 0.0;
+    core.settings.sample_rate = prev_rate;
     if core.settings.virtual_sink_volume.is_none() {
         core.settings.virtual_sink_volume = prev_vol;
     }
     #[cfg(target_os = "linux")]
     core.apply_volume_mode(was_bypass);
+    let route = route_of(&core.settings);
+    drop(core);
+
+    let rate = detect_rate_async(route.0.clone(), route.1.clone())
+        .await
+        .unwrap_or(prev_rate);
+    let mut core = state.core.lock().await;
+    if route_of(&core.settings) == route {
+        core.settings.sample_rate = rate;
+    }
     core.save()?;
     match core.engine.running_io() {
         Some(running) if running == core.settings.io_config() => core.hot_push().await?,
@@ -307,10 +377,13 @@ async fn stop_engine(state: tauri::State<'_, AppState>) -> Result<AppStateRespon
     Ok(core.view().await)
 }
 
-/// Live status and per-channel signal levels from CamillaDSP.
+/// Live status and per-channel signal levels from CamillaDSP. While the
+/// engine runs, the source sample rate is re-detected every ~2 s; a change
+/// restarts CamillaDSP at the new rate.
 #[tauri::command]
 async fn get_live_meters(state: tauri::State<'_, AppState>) -> Result<LiveMeters, String> {
     let mut core = state.core.lock().await;
+    core.rate_poll_ticks = core.rate_poll_ticks.wrapping_add(1);
     #[cfg(target_os = "linux")]
     if core.settings.hw_volume_bypass {
         if crate::devices::read_linux_virtual_sink_volume() != Some(100) {
@@ -322,27 +395,53 @@ async fn get_live_meters(state: tauri::State<'_, AppState>) -> Result<LiveMeters
             let _ = core.store.save_settings(&core.settings);
         }
     }
-    Ok(core.engine.meters().await)
+    if core.engine.is_running() && core.rate_poll_ticks % 10 == 0 {
+        let route = route_of(&core.settings);
+        drop(core);
+        let detected = detect_rate_async(route.0.clone(), route.1.clone()).await;
+        core = state.core.lock().await;
+        if let Some(new_rate) = detected {
+            if core.engine.is_running()
+                && route_of(&core.settings) == route
+                && new_rate != core.settings.sample_rate
+            {
+                core.settings.sample_rate = new_rate;
+                let _ = core.save();
+                let _ = core.launch().await;
+            }
+        }
+    }
+    let mut meters = core.engine.meters().await;
+    meters.sample_rate = core.settings.sample_rate;
+    meters.chunksize = core.settings.chunksize;
+    Ok(meters)
 }
 
-/// Save the current DSP settings as a named profile and make it active.
+/// Save the current DSP settings as a named profile and make it active. The
+/// saved profile always uses automatic anti-clip preamp.
 #[tauri::command]
 async fn save_profile(name: String, state: tauri::State<'_, AppState>) -> Result<AppStateResponse, String> {
     let mut core = state.core.lock().await;
-    let dsp = core.settings.dsp();
+    let mut dsp = core.settings.dsp();
+    dsp.auto_preamp = true;
+    dsp.preamp_db = 0.0;
     core.store.save_profile(&name, &dsp)?;
+    core.settings.apply_dsp(&dsp);
     core.settings.active_profile = name.trim().to_string();
     core.save()?;
     Ok(core.view().await)
 }
 
 /// Apply a named profile's DSP settings (the IO route is kept), make it
-/// active, and push the result to a running engine.
+/// active, and push the result to a running engine. Preamp is always
+/// automatic anti-clip, whatever the profile file holds.
 #[tauri::command]
 async fn load_profile(name: String, state: tauri::State<'_, AppState>) -> Result<AppStateResponse, String> {
     let mut core = state.core.lock().await;
     let profile = core.store.load_profile(&name)?;
     core.settings.apply_dsp(&profile.dsp);
+    core.settings.auto_preamp = true;
+    core.settings.preamp_db = 0.0;
     core.settings.active_profile = profile.name;
     core.save()?;
     core.apply_to_engine().await?;
@@ -360,20 +459,22 @@ async fn delete_profile(name: String, state: tauri::State<'_, AppState>) -> Resu
     Ok(core.view().await)
 }
 
-/// Parse EqualizerAPO / AutoEQ text and replace the EQ. A preamp line sets
-/// the preamp and turns auto-preamp off, as the UI does. The EQ is enabled.
+/// Parse EqualizerAPO / AutoEQ text and replace the EQ, which is enabled. The
+/// result is always the 10-band Graphic EQ: parametric bands are fitted onto
+/// it, and `GraphicEQ:` curves are fitted the same way. A `Preamp:` line is
+/// validated but ignored: preamp is automatic anti-clip headroom computed from
+/// the imported EQ curve.
 #[tauri::command]
 async fn import_autoeq(text: String, state: tauri::State<'_, AppState>) -> Result<AppStateResponse, String> {
-    let (preamp, bands) = parse_autoeq_text(&text)?;
+    let (_preamp, bands) = parse_autoeq_text(&text)?;
     let mut core = state.core.lock().await;
     core.settings.eq_bands = bands.iter().map(|b| b.sanitized()).collect();
     core.settings.eq_enabled = true;
-    if let Some(preamp_db) = preamp {
-        core.settings.preamp_db = preamp_db;
-        core.settings.auto_preamp = false;
-    }
+    core.settings.preamp_db = 0.0;
+    core.settings.auto_preamp = true;
     core.settings.active_profile = IMPORTED_PROFILE_LABEL.to_string();
     core.settings = core.settings.sanitized();
+    core.settings.eq_bands = crate::peq::normalize_geq_bands(&core.settings.eq_bands);
     core.save()?;
     core.apply_to_engine().await?;
     Ok(core.view().await)
@@ -405,6 +506,47 @@ fn set_webview_zoom(zoom: f64, window: tauri::WebviewWindow) -> Result<f64, Stri
     Ok(clamped)
 }
 
+/// Origin of the only external link the app opens: the AutoEQ headphone search.
+const AUTOEQ_ORIGIN: &str = "https://autoeq.app";
+
+/// True for `https://autoeq.app` and paths under it, with no whitespace,
+/// control characters, or shell metacharacters. The Windows launcher runs the
+/// URL through `cmd`, where those characters would split or extend the command.
+fn is_permitted_external_url(url: &str) -> bool {
+    let origin_ok = url == AUTOEQ_ORIGIN || url.starts_with(&format!("{AUTOEQ_ORIGIN}/"));
+    origin_ok
+        && url
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '&' | '|' | '<' | '>' | '^' | '"' | '%' | '(' | ')' | '!'))
+}
+
+/// Open an AutoEQ link in the system browser. Any other URL is rejected
+/// before a process is started.
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !is_permitted_external_url(trimmed) {
+        return Err("only https://autoeq.app links are permitted".to_string());
+    }
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open")
+        .arg(trimmed)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("opening browser: {e}"))?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", trimmed])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("opening browser: {e}"))?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -422,6 +564,7 @@ pub fn run() {
                     settings,
                     devices: None,
                     engine,
+                    rate_poll_ticks: 0,
                 }),
             });
             Ok(())
@@ -439,6 +582,7 @@ pub fn run() {
             import_autoeq,
             export_autoeq,
             set_webview_zoom,
+            open_external_url,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Headphone DSP");
@@ -489,6 +633,7 @@ mod tests {
                 ..DeviceList::default()
             }),
             engine: CamillaEngine::new(std::env::temp_dir().join("hdsp-lib-test-log")),
+            rate_poll_ticks: 0,
         };
         assert!(core.ensure_device_defaults());
         assert_eq!(core.settings.capture_device, LINUX_VIRTUAL_SINK_MONITOR);
@@ -515,6 +660,33 @@ mod tests {
     }
 
     #[test]
+    fn open_external_url_rejects_disallowed_urls() {
+        for url in [
+            "http://example.com",
+            "file:///etc/passwd",
+            "https://autoeq.app.evil.example",
+            "https://autoeq.app.example/",
+            "https://autoeq.app/?q=a&calc",
+            "https://autoeq.app/ x",
+            "",
+        ] {
+            assert_eq!(
+                open_external_url(url.to_string()),
+                Err("only https://autoeq.app links are permitted".to_string()),
+                "url {url:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn autoeq_links_are_the_only_permitted_external_urls() {
+        assert!(is_permitted_external_url("https://autoeq.app"));
+        assert!(is_permitted_external_url("https://autoeq.app/?q=hd650"));
+        assert!(!is_permitted_external_url("http://autoeq.app"));
+        assert!(!is_permitted_external_url("https://autoeq.app.example/"));
+    }
+
+    #[test]
     fn response_serializes_with_ui_field_names() {
         let (peq, crossfeed) = compute_curves(&AppSettings::default().dsp(), DEFAULT_SAMPLE_RATE);
         let response = AppStateResponse {
@@ -532,8 +704,8 @@ mod tests {
         }
         assert_eq!(value["meters"]["capture_peak"], serde_json::json!([-120.0, -120.0]));
         assert_eq!(value["meters"]["state"], "Stopped");
-        assert_eq!(value["settings"]["chunksize"], 2048);
-        assert_eq!(value["settings"]["eq_bands"][0]["band_type"], "low_shelf");
+        assert_eq!(value["settings"]["chunksize"], 512);
+        assert_eq!(value["settings"]["eq_bands"][0]["band_type"], "bell");
         assert_eq!(
             serde_json::to_value(ExportAutoEqResponse { text: "x".into() }).unwrap(),
             serde_json::json!({"text": "x"})

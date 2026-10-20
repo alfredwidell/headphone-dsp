@@ -1,18 +1,18 @@
 # Headphone DSP
 
-Standalone desktop **Crossfeed + Parametric EQ** headphone processor for **Linux** and **Windows**, built with **Tauri v2 (Rust)** and an embedded **CamillaDSP 4.1.3** engine.
+Standalone desktop **Crossfeed + 10-Band Graphic EQ** headphone processor for **Linux** and **Windows**, built with **Tauri v2 (Rust)** and an embedded **CamillaDSP 4.1.3** engine.
 
 ## Features
 
 - **Neumann KU100 Mid/Side Binaural Crossfeed**:
-  - Uses measured horizontal-plane Neumann KU100 dummy-head HRIRs (`0°–90°` at `44.1 kHz` and `48 kHz`, with Woodworth ITD + head-shadow fallback for other rates).
+  - Uses measured horizontal-plane Neumann KU100 dummy-head HRIRs (`0°–90°` at `44.1 kHz` and `48 kHz`). Higher source sample rates (`88.2`, `96`, `176.4`, `192 kHz`, etc.) are automatically resampled by CamillaDSP to the integer-divisor base rate (`44.1 kHz` or `48 kHz`) so measured KU100 HRIR filters are always used.
   - Applies spectral-division **Mid flatness** correction (`0–18 dB` soft-knee limiter + 512-sample modeling delay) so centered mono content (vocals, bass, snare) stays flat and forward while the stereo Side channel carries the exact measured KU100 interaural level, frequency, and phase/ITD cues (`contra / ipsi == h`).
   - Literal Mid/Side CamillaDSP pipeline (`crossfeed_to_mid_side` mixer → 2048-tap `Conv` filters on Mid and Side → `crossfeed_from_mid_side` mixer).
-- **Parametric Equalizer (up to 12 bands)**:
-  - Interactive frequency-response graph (20 Hz – 20 kHz) with draggable band handles (`Frequency`, `Gain`, and mousewheel `Q`) plus individual and composite response curves.
-  - Native CamillaDSP biquad filters (`Peaking`, `Lowshelf`, `Highshelf`, `Highpass`, `Lowpass`, `Notch`).
-  - **Auto-Preamp (Anti-Clip)** headroom protection that automatically attenuates by the peak positive EQ boost, plus manual preamp trim.
-  - **Headphone Profiles & AutoEQ Import/Export**: Save/load named headphone profiles and import/export standard EqualizerAPO / AutoEQ / Oratory1990 `.txt` configurations.
+- **10-Band AutoEQ Graphic Equalizer (`Q = 1.41`)**:
+  - ISO octave centers (`31, 62, 125, 250, 500, 1k, 2k, 4k, 8k, 16k Hz`) with constant `Q = 1.41` peaking biquads, matching AutoEQ's 10-band Fixed-Band EQ.
+  - Interactive frequency-response graph (20 Hz – 20 kHz) with vertical-drag band handles plus a 10-channel studio vertical fader bank (drag, mousewheel, keyboard, numeric input, and double-click to reset).
+  - **Automatic Anti-Clip Preamp**: Integrated directly into the Graphic EQ — automatically attenuates by the peak positive EQ boost (`min(-raw_peak_db, 0)`) so the composite curve never exceeds `0 dB`.
+  - **Headphone Profiles & AutoEQ Import/Export**: Save/load named headphone profiles and import/export AutoEQ presets (supports 10-band Fixed-Band EQ directly, and automatically fits arbitrary AutoEQ Parametric / GraphicEQ curves onto the 10 bands).
 - **Zero-Driver Loopback Capture**:
   - **Windows (Option 1 — Zero-driver WASAPI Loopback)**: Captures system audio from a Windows playback endpoint via CamillaDSP's native `Wasapi` `loopback: true` capture mode and outputs to your headphone DAC via `Wasapi` (shared or exclusive mode).
   - **Linux (PipeWire / PulseAudio + ALSA)**: Automatically creates a `"Headphone DSP Virtual Input"` sink (`headphone_dsp_sink`) on startup, captures from `headphone_dsp_sink.monitor`, and outputs directly to your hardware DAC via ALSA or PipeWire/PulseAudio.

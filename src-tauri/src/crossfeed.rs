@@ -55,6 +55,22 @@ pub fn coerce_crossfeed_mid_boost_db(value: f64) -> f64 {
     value.clamp(MIN_CROSSFEED_MID_BOOST_DB, MAX_CROSSFEED_MID_BOOST_DB)
 }
 
+/// The KU100-compatible base rate (44 100 or 48 000 Hz) that DSP runs at for
+/// a given source rate. Integer multiples of 44.1 kHz map to 44 100 Hz,
+/// integer multiples of 48 kHz to 48 000 Hz. Other rates map to whichever
+/// base is closer, 44 100 Hz below 46 050 Hz.
+pub fn ku100_base_sample_rate(source_rate: u32) -> u32 {
+    if source_rate > 0 && source_rate % 44_100 == 0 {
+        44_100
+    } else if source_rate > 0 && source_rate % 48_000 == 0 {
+        48_000
+    } else if source_rate < 46_050 {
+        44_100
+    } else {
+        48_000
+    }
+}
+
 fn woodworth_itd_seconds(angle_deg: f64) -> f64 {
     let angle_rad = coerce_crossfeed_angle_deg(angle_deg).to_radians();
     let head_radius_m = 0.0875;
@@ -461,6 +477,16 @@ mod tests {
         assert!(ku100_asset_available(30.0, 44100));
         assert!(ku100_asset_available(30.0, 48000));
         assert!(!ku100_asset_available(30.0, 96000));
+    }
+
+    #[test]
+    fn ku100_base_rate_follows_integer_divisors() {
+        for rate in [44_100, 88_200, 176_400, 352_800] {
+            assert_eq!(ku100_base_sample_rate(rate), 44_100, "source {rate}");
+        }
+        for rate in [48_000, 96_000, 192_000, 384_000] {
+            assert_eq!(ku100_base_sample_rate(rate), 48_000, "source {rate}");
+        }
     }
 
     #[test]

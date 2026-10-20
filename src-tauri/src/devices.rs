@@ -123,10 +123,12 @@ fn enumerate_windows(list: &mut DeviceList) {
     }
 }
 
-/// Run a command and return its stdout lines.
+/// Run a command and return its stdout lines. `LC_ALL=C` keeps tool output
+/// (pactl's column text, sample-spec labels) locale-independent.
 #[cfg(target_os = "linux")]
 fn run_lines(program: &str, args: &[&str]) -> Result<Vec<String>, String> {
     let output = std::process::Command::new(program)
+        .env("LC_ALL", "C")
         .args(args)
         .output()
         .map_err(|e| format!("{program} not available: {e}"))?;
@@ -146,6 +148,131 @@ fn run_lines(program: &str, args: &[&str]) -> Result<Vec<String>, String> {
 /// Second tab-separated column of a `pactl list short` line (the name).
 fn pactl_short_name(line: &str) -> Option<&str> {
     line.split('\t').nth(1).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Lowest and highest sample rates accepted from the platform.
+const SAMPLE_RATE_RANGE: std::ops::RangeInclusive<u32> = 8_000..=384_000;
+
+/// Sample rate from a `pactl` line (e.g. `float32le 2ch 48000Hz`): the first
+/// whitespace-separated token ending in `Hz`/`hz` whose numeric prefix is a
+/// plausible rate.
+pub fn parse_pactl_sample_rate(line: &str) -> Option<u32> {
+    line.split_whitespace().find_map(|token| {
+        let number = token
+            .strip_suffix("Hz")
+            .or_else(|| token.strip_suffix("hz"))?;
+        let rate: u32 = number.parse().ok()?;
+        SAMPLE_RATE_RANGE.contains(&rate).then_some(rate)
+    })
+}
+
+/// Sample rate of the audio that a capture device will deliver, from
+/// `pactl list short` output.
+///
+/// For a `<sink>.monitor` source the sink's own rate is only a fallback: an
+/// active sink-input (a playing stream routed into the sink) sets the rate
+/// the sink actually carries, so the highest active input rate wins. Without
+/// one, the monitor source's rate, then the sink's rate, is used. Other
+/// capture devices report their own source rate.
+pub fn parse_pactl_source_sample_rate(
+    capture_device: &str,
+    sources: &[String],
+    sinks: &[String],
+    sink_inputs: &[String],
+) -> Option<u32> {
+    let find_source_rate = || {
+        sources
+            .iter()
+            .find(|line| pactl_short_name(line) == Some(capture_device))
+            .and_then(|line| parse_pactl_sample_rate(line))
+    };
+
+    let Some(sink_name) = capture_device.strip_suffix(".monitor") else {
+        return find_source_rate();
+    };
+
+    let sink_line = sinks
+        .iter()
+        .find(|line| pactl_short_name(line) == Some(sink_name));
+    let sink_index = sink_line
+        .and_then(|line| line.split('\t').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let sink_rate = sink_line.and_then(|line| parse_pactl_sample_rate(line));
+
+    if let Some(index) = sink_index {
+        let input_rate = sink_inputs
+            .iter()
+            .filter(|line| line.split('\t').nth(1).map(str::trim) == Some(index))
+            .filter_map(|line| parse_pactl_sample_rate(line))
+            .max();
+        if input_rate.is_some() {
+            return input_rate;
+        }
+    }
+
+    find_source_rate().or(sink_rate)
+}
+
+/// Detect the sample rate of the active audio source for the given capture
+/// and playback devices. Returns `None` when it cannot be determined.
+pub fn detect_source_sample_rate(capture_device: &str, playback_device: &str) -> Option<u32> {
+    detect_platform_sample_rate(capture_device, playback_device)
+        .filter(|rate| SAMPLE_RATE_RANGE.contains(rate))
+}
+
+#[cfg(target_os = "linux")]
+fn detect_platform_sample_rate(capture_device: &str, _playback_device: &str) -> Option<u32> {
+    let sources = run_lines("pactl", &["list", "short", "sources"]).unwrap_or_default();
+    let sinks = run_lines("pactl", &["list", "short", "sinks"]).unwrap_or_default();
+    let sink_inputs = run_lines("pactl", &["list", "short", "sink-inputs"]).unwrap_or_default();
+    parse_pactl_source_sample_rate(capture_device, &sources, &sinks, &sink_inputs).or_else(|| {
+        run_lines("pactl", &["info"])
+            .unwrap_or_default()
+            .iter()
+            .filter(|line| line.starts_with("Default Sample Specification:"))
+            .find_map(|line| parse_pactl_sample_rate(line))
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn detect_platform_sample_rate(capture_device: &str, playback_device: &str) -> Option<u32> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let output_named = |wanted: &str| {
+        host.output_devices()
+            .into_iter()
+            .flatten()
+            .find(|device| device.name().ok().as_deref() == Some(wanted))
+    };
+    let input_named = |wanted: &str| {
+        host.input_devices()
+            .into_iter()
+            .flatten()
+            .find(|device| device.name().ok().as_deref() == Some(wanted))
+    };
+
+    // Capture endpoint first: a render endpoint used for loopback, then a
+    // real capture device. The playback endpoint is the last resort.
+    output_named(capture_device)
+        .and_then(|device| device.default_output_config().ok())
+        .map(|config| config.sample_rate().0)
+        .or_else(|| {
+            input_named(capture_device)
+                .and_then(|device| device.default_input_config().ok())
+                .map(|config| config.sample_rate().0)
+        })
+        .or_else(|| {
+            output_named(playback_device)
+                .and_then(|device| device.default_output_config().ok())
+                .map(|config| config.sample_rate().0)
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn detect_platform_sample_rate(_capture_device: &str, _playback_device: &str) -> Option<u32> {
+    None
 }
 
 /// Read the current volume percentage (`0..=150`) of `headphone_dsp_sink`.
@@ -556,6 +683,79 @@ default
         assert!(capture[2].is_loopback);
         assert_eq!(playback.len(), 1, "virtual sink is not offered as an output");
         assert_eq!(playback[0].id, "alsa_output.pci");
+    }
+
+    #[test]
+    fn pactl_sample_rate_is_read_from_the_spec_token() {
+        assert_eq!(
+            parse_pactl_sample_rate("874\theadphone_dsp_sink.monitor\tPipeWire\tfloat32le 2ch 48000Hz\tSUSPENDED"),
+            Some(48_000)
+        );
+        assert_eq!(parse_pactl_sample_rate("Default Sample Specification: s16le 2ch 44100hz"), Some(44_100));
+        assert_eq!(parse_pactl_sample_rate("0\tsink\tmod\ts16le 2ch 7999Hz\tIDLE"), None, "below range");
+        assert_eq!(parse_pactl_sample_rate("0\tsink\tmod\ts16le 2ch 384001Hz\tIDLE"), None, "above range");
+        assert_eq!(parse_pactl_sample_rate("0\tsink\tmod\ts16le 2ch 48000\tIDLE"), None, "no Hz suffix");
+        assert_eq!(parse_pactl_sample_rate("0\tsink\tmod\ts16le 2ch xHz\tIDLE"), None, "not numeric");
+    }
+
+    fn lines(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn monitor_rate_follows_active_sink_input_over_idle_virtual_sink() {
+        let sources = lines(&["1\theadphone_dsp_sink.monitor\tmodule\ts16le 2ch 48000Hz\tIDLE"]);
+        let sinks = lines(&["1\theadphone_dsp_sink\tmodule\tfloat32le 2ch 48000Hz\tIDLE"]);
+        let at_44k = lines(&["7\t1\tspotify\tprotocol\tfloat32le 2ch 44100Hz\tRUNNING"]);
+        assert_eq!(
+            parse_pactl_source_sample_rate("headphone_dsp_sink.monitor", &sources, &sinks, &at_44k),
+            Some(44_100)
+        );
+        let at_96k = lines(&["7\t1\tplayer\tprotocol\tfloat32le 2ch 96000Hz\tRUNNING"]);
+        assert_eq!(
+            parse_pactl_source_sample_rate("headphone_dsp_sink.monitor", &sources, &sinks, &at_96k),
+            Some(96_000)
+        );
+    }
+
+    #[test]
+    fn monitor_rate_falls_back_to_source_then_sink_without_active_inputs() {
+        let sources = lines(&["1\theadphone_dsp_sink.monitor\tmodule\ts16le 2ch 48000Hz\tIDLE"]);
+        let sinks = lines(&["1\theadphone_dsp_sink\tmodule\tfloat32le 2ch 44100Hz\tIDLE"]);
+        assert_eq!(
+            parse_pactl_source_sample_rate("headphone_dsp_sink.monitor", &sources, &sinks, &[]),
+            Some(48_000),
+            "monitor source rate when no sink-input is active"
+        );
+        assert_eq!(
+            parse_pactl_source_sample_rate("headphone_dsp_sink.monitor", &[], &sinks, &[]),
+            Some(44_100),
+            "sink rate when the monitor source is missing"
+        );
+        assert_eq!(parse_pactl_source_sample_rate("headphone_dsp_sink.monitor", &[], &[], &[]), None);
+    }
+
+    #[test]
+    fn sink_inputs_on_other_sinks_are_ignored() {
+        let sources = lines(&["1\theadphone_dsp_sink.monitor\tmodule\ts16le 2ch 48000Hz\tIDLE"]);
+        let sinks = lines(&[
+            "1\theadphone_dsp_sink\tmodule\tfloat32le 2ch 48000Hz\tIDLE",
+            "2\talsa_output.pci\tmodule\ts32le 2ch 192000Hz\tRUNNING",
+        ]);
+        let sink_inputs = lines(&["9\t2\tbrowser\tprotocol\tfloat32le 2ch 192000Hz\tRUNNING"]);
+        assert_eq!(
+            parse_pactl_source_sample_rate("headphone_dsp_sink.monitor", &sources, &sinks, &sink_inputs),
+            Some(48_000),
+            "a stream on another sink must not drive this sink's rate"
+        );
+    }
+
+    #[test]
+    fn non_monitor_capture_uses_its_own_source_rate() {
+        let sources = lines(&["3\talsa_input.usb\tmodule\ts24le 2ch 96000Hz\tRUNNING"]);
+        let sinks = lines(&["3\talsa_input.usb\tmodule\ts24le 2ch 44100Hz\tIDLE"]);
+        assert_eq!(parse_pactl_source_sample_rate("alsa_input.usb", &sources, &sinks, &[]), Some(96_000));
+        assert_eq!(parse_pactl_source_sample_rate("alsa_input.missing", &sources, &sinks, &[]), None);
     }
 
     #[test]

@@ -118,7 +118,10 @@ pub fn build_config(io: &IoConfig, dsp: &DspSettings, runtime_dir: &Path) -> Res
         return Err("sample rate must be positive".to_string());
     }
     let dsp = dsp.sanitized();
-    let fs = io.sample_rate;
+    // The DSP runs at the KU100 base rate (44.1 or 48 kHz). Higher source
+    // rates are resampled down by CamillaDSP at capture.
+    let source_fs = io.sample_rate;
+    let fs = crate::crossfeed::ku100_base_sample_rate(source_fs);
 
     let mut filters = Map::new();
     let mut mixers = Map::new();
@@ -228,17 +231,32 @@ pub fn build_config(io: &IoConfig, dsp: &DspSettings, runtime_dir: &Path) -> Res
         }
     }
 
+    let mut devices = json!({
+        "samplerate": fs,
+        "chunksize": io.chunk_size,
+        "enable_rate_adjust": false,
+        "silence_threshold": -160,
+        "silence_timeout": 5,
+        "capture": capture_device(io)?,
+        "playback": playback_device(io)?
+    });
+    if source_fs != fs {
+        // Integer ratios use CamillaDSP's synchronous resampler; anything
+        // else (including upsampling from below the base rate) is asynchronous.
+        let resampler = if source_fs > fs && source_fs % fs == 0 {
+            json!({"type": "Synchronous"})
+        } else {
+            json!({"type": "AsyncSinc", "profile": "Balanced"})
+        };
+        if let Some(map) = devices.as_object_mut() {
+            map.insert("capture_samplerate".to_string(), json!(source_fs));
+            map.insert("resampler".to_string(), resampler);
+        }
+    }
+
     Ok(json!({
         "title": "Headphone DSP",
-        "devices": {
-            "samplerate": fs,
-            "chunksize": io.chunk_size,
-            "enable_rate_adjust": false,
-            "silence_threshold": -160,
-            "silence_timeout": 5,
-            "capture": capture_device(io)?,
-            "playback": playback_device(io)?
-        },
+        "devices": devices,
         "filters": Value::Object(filters),
         "mixers": Value::Object(mixers),
         "pipeline": pipeline
@@ -295,6 +313,10 @@ pub const SILENT_DB: f64 = -120.0;
 pub struct LiveMeters {
     pub running: bool,
     pub state: String,
+    /// Sample rate the pipeline runs at (or the backend's current choice when stopped).
+    pub sample_rate: u32,
+    /// Chunk size the pipeline runs with.
+    pub chunksize: usize,
     pub capture_peak: Vec<f64>,
     pub playback_peak: Vec<f64>,
     pub capture_rms: Vec<f64>,
@@ -314,6 +336,8 @@ impl LiveMeters {
         Self {
             running: false,
             state: "Stopped".to_string(),
+            sample_rate: crate::state::DEFAULT_SAMPLE_RATE,
+            chunksize: crate::state::DEFAULT_CHUNKSIZE,
             capture_peak: Self::silent(),
             playback_peak: Self::silent(),
             capture_rms: Self::silent(),
@@ -548,6 +572,11 @@ impl CamillaEngine {
         if !self.is_running() {
             return LiveMeters::stopped(self.last_error.clone());
         }
+        let (sample_rate, chunksize) = self
+            .running_io
+            .as_ref()
+            .map(|io| (io.sample_rate, io.chunk_size))
+            .unwrap_or((crate::state::DEFAULT_SAMPLE_RATE, crate::state::DEFAULT_CHUNKSIZE));
         let state = self
             .request(&json!("GetState"))
             .await
@@ -583,6 +612,8 @@ impl CamillaEngine {
         LiveMeters {
             running: true,
             state,
+            sample_rate,
+            chunksize,
             capture_peak,
             playback_peak,
             capture_rms,
@@ -673,6 +704,38 @@ mod tests {
         assert!(filters["parametric_eq_band_2"]["parameters"].get("gain").is_none());
         assert!(dir.join("generated_fir/mid_filter.txt").is_file());
         assert!(dir.join("generated_fir/side_filter.txt").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn high_rate_sources_resample_to_the_ku100_base_rate() {
+        let dir = temp_dir("resample");
+        let mut route = io("pulse", false);
+        let dsp = DspSettings::default();
+
+        route.sample_rate = 88_200;
+        let cfg = build_config(&route, &dsp, &dir).unwrap();
+        assert_eq!(cfg["devices"]["samplerate"], 44_100);
+        assert_eq!(cfg["devices"]["capture_samplerate"], 88_200);
+        assert_eq!(cfg["devices"]["resampler"]["type"], "Synchronous");
+
+        route.sample_rate = 96_000;
+        let cfg = build_config(&route, &dsp, &dir).unwrap();
+        assert_eq!(cfg["devices"]["samplerate"], 48_000);
+        assert_eq!(cfg["devices"]["capture_samplerate"], 96_000);
+        assert_eq!(cfg["devices"]["resampler"]["type"], "Synchronous");
+
+        route.sample_rate = 32_000;
+        let cfg = build_config(&route, &dsp, &dir).unwrap();
+        assert_eq!(cfg["devices"]["samplerate"], 44_100);
+        assert_eq!(cfg["devices"]["capture_samplerate"], 32_000);
+        assert_eq!(cfg["devices"]["resampler"]["type"], "AsyncSinc");
+
+        route.sample_rate = 48_000;
+        let cfg = build_config(&route, &dsp, &dir).unwrap();
+        assert_eq!(cfg["devices"]["samplerate"], 48_000);
+        assert!(cfg["devices"].get("capture_samplerate").is_none());
+        assert!(cfg["devices"].get("resampler").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -6,10 +6,20 @@
   'use strict';
   const $ = id => document.getElementById(id);
   const clone = value => JSON.parse(JSON.stringify(value));
+  const automaticPreamp = value => ({...clone(value), auto_preamp:true, preamp_db:0, eq_bands:normalizeGeq(value.eq_bands,value.sample_rate)});
   const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
   const signed = (n, digits = 1) => `${n < 0 ? '−' : '+'}${Math.abs(n).toFixed(digits)}`;
+  const dspSampleRate = rate => (rate > 0 && rate % 44100 === 0) ? 44100 : (rate > 0 && rate % 48000 === 0) ? 48000 : (rate < 46050 ? 44100 : 48000);
+  const formatRate = rate => {
+    const dsp = dspSampleRate(rate);
+    return rate !== dsp ? `${rate/1000} → ${dsp/1000} kHz` : `${dsp/1000} kHz`;
+  };
   const colors = ['#7dd3c8', '#e8b34b', '#c59af2', '#e68b9b', '#85a9ee', '#bed583', '#e6a878', '#86c5e5', '#d995d1', '#8fd6ae', '#c6b88e', '#a8a0e8'];
-  const types = {bell:'Bell / Peaking', low_shelf:'Low shelf', high_shelf:'High shelf', high_pass:'High pass', low_pass:'Low pass', notch:'Notch'};
+  const geqFreqs = [31,62,125,250,500,1000,2000,4000,8000,16000];
+  const geqLabels = ['31','62','125','250','500','1k','2k','4k','8k','16k'];
+  const geqQ = 1.41;
+  const geqMaxGain = 6;
+  const makeGeqBands = (gains=[]) => geqFreqs.map((freq_hz,i)=>({enabled:true,band_type:'bell',freq_hz,gain_db:clamp(Number.isFinite(gains[i])?gains[i]:0,-geqMaxGain,geqMaxGain),q:geqQ}));
   const gainTypes = new Set(['bell', 'low_shelf', 'high_shelf']);
   const previewMode = !window.__TAURI__?.core?.invoke;
   const zoomStorageKey = 'headphone-dsp.ui-zoom.v1';
@@ -18,9 +28,6 @@
   function setUIZoom(value, persist = true) {
     if (!Number.isFinite(value)) value = 1;
     uiZoom = Math.round(clamp(value, .7, 2) * 100) / 100;
-    $('zoom-reset').textContent = `${Math.round(uiZoom * 100)}%`;
-    $('zoom-out').disabled = uiZoom <= .7;
-    $('zoom-in').disabled = uiZoom >= 2;
     if (persist) {
       try { localStorage.setItem(zoomStorageKey, String(uiZoom)); } catch { /* Zoom still works without storage. */ }
     }
@@ -37,9 +44,6 @@
     }
   }
 
-  $('zoom-out').addEventListener('click', () => setUIZoom(uiZoom - .1));
-  $('zoom-in').addEventListener('click', () => setUIZoom(uiZoom + .1));
-  $('zoom-reset').addEventListener('click', () => setUIZoom(1));
   window.addEventListener('keydown', event => {
     if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
     let next;
@@ -51,7 +55,7 @@
     setUIZoom(next);
   }, { passive: false });
   window.addEventListener('wheel', event => {
-    if (!(event.ctrlKey || event.metaKey) || event.target.closest?.('[data-handle]')) return;
+    if (!(event.ctrlKey || event.metaKey)) return;
     event.preventDefault();
     if (!event.deltaY) return;
     const pixels = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? window.innerHeight : 1);
@@ -60,9 +64,9 @@
   const defaults = {
     capture_backend:'Pulse', capture_device:'headphone_dsp_sink.monitor', capture_loopback:true,
     playback_backend:'Alsa', playback_device:'plughw:CARD=Generic_1,DEV=0', exclusive_mode:false, hw_volume_bypass:false,
-    sample_rate:48000, chunksize:2048, master_bypass:false, preamp_db:0, auto_preamp:true,
+    sample_rate:48000, chunksize:512, master_bypass:false, preamp_db:0, auto_preamp:true,
     crossfeed_enabled:true, crossfeed_angle_deg:35, crossfeed_mid_boost_db:3, eq_enabled:true,
-    eq_bands:[{enabled:true,band_type:'low_shelf',freq_hz:105,gain_db:4,q:.71}, {enabled:true,band_type:'bell',freq_hz:1000,gain_db:0,q:1}, {enabled:true,band_type:'high_shelf',freq_hz:8000,gain_db:-1.5,q:.71}], active_profile:'Default'
+    eq_bands:makeGeqBands([3.5,3,1.5,0,0,0,0,-.5,-1.5,-1.5]), active_profile:'Default'
   };
   let state = null, settings = clone(defaults), revision = 0, selectedBand = -1;
   let updateTimer, queue = Promise.resolve(), pollTimer, pollBusy = false, pollGeneration = 0;
@@ -71,9 +75,9 @@
   let profileAction = 'save', engineBusy = false, actionDepth = 0;
   const storageKey = 'headphone-dsp.preview.profiles.v1';
   const builtins = {
-    'Flat / Neutral': {...clone(defaults), eq_bands:[], crossfeed_enabled:false},
-    'Warm Vocal & Sub-Bass': {...clone(defaults), eq_bands:[{enabled:true,band_type:'low_shelf',freq_hz:85,gain_db:4.5,q:.71},{enabled:true,band_type:'bell',freq_hz:1800,gain_db:1.5,q:1.1},{enabled:true,band_type:'high_shelf',freq_hz:7500,gain_db:-2,q:.71}]},
-    'HD 650 / 6XX Harman Target': {...clone(defaults), eq_bands:[{enabled:true,band_type:'low_shelf',freq_hz:105,gain_db:5.5,q:.71},{enabled:true,band_type:'bell',freq_hz:3100,gain_db:-2.2,q:1.8},{enabled:true,band_type:'high_shelf',freq_hz:9000,gain_db:2,q:.71}]}
+    'Flat / Neutral': {...clone(defaults), eq_bands:makeGeqBands(), crossfeed_enabled:false},
+    'Warm Vocal & Sub-Bass': {...clone(defaults), eq_bands:makeGeqBands([4.5,4,2,0,0,.5,1.5,0,-2,-2])},
+    'HD 650 / 6XX Harman Target': {...clone(defaults), eq_bands:makeGeqBands([5.5,5,2.5,0,0,0,-1,-2,2,2])}
   };
   let mockProfiles = clone(builtins);
   try { const stored = JSON.parse(localStorage.getItem(storageKey) || 'null'); if (stored && typeof stored === 'object' && !Array.isArray(stored)) mockProfiles = {...stored}; } catch { /* Private browser / invalid storage: use defaults. */ }
@@ -106,15 +110,31 @@
     return 10*Math.log10(Math.max(1e-16,numerator)/Math.max(1e-16,denominator));
   }
   function computePEQ(s) {
+    const rate = dspSampleRate(s.sample_rate);
     const freq_hz = Array.from({length:280}, (_,i) => 20 * 1000**(i/279));
     const per_band_db = s.eq_bands.map(band => {
-      const coeff = coefficients(band,s.sample_rate);
-      return freq_hz.map(f => band.enabled ? responseAt(coeff,f,s.sample_rate) : 0);
+      const coeff = coefficients(band,rate);
+      return freq_hz.map(f => band.enabled ? responseAt(coeff,f,rate) : 0);
     });
     const composite_db = freq_hz.map((_,i) => s.eq_enabled ? per_band_db.reduce((sum,values) => sum+values[i],0) : 0);
     const raw_peak_db = Math.max(0,...composite_db);
     const effective_preamp_db = s.master_bypass ? 0 : s.preamp_db - (s.auto_preamp ? Math.max(0,raw_peak_db) : 0);
     return {freq_hz,per_band_db,composite_db,raw_peak_db,effective_preamp_db};
+  }
+  function fitGeq(target,rate) {
+    const bands=makeGeqBands();
+    // Fit the sampled target, including overlap between neighboring bells.
+    for(let pass=0;pass<16;pass++) geqFreqs.forEach((f,i)=>{
+      const current=bands.reduce((sum,b)=>sum+responseAt(coefficients(b,rate),f,rate),0);
+      bands[i].gain_db=clamp(bands[i].gain_db+.7*(target[i]-current),-geqMaxGain,geqMaxGain);
+    });
+    return makeGeqBands(bands.map(b=>Math.round(b.gain_db*10)/10));
+  }
+  function normalizeGeq(bands=[],sourceRate=48000) {
+    if(bands.length===10 && bands.every((b,i)=>b.band_type==='bell' && b.freq_hz===geqFreqs[i] && b.q===geqQ))
+      return makeGeqBands(bands.map(b=>b.enabled?b.gain_db:0));
+    const rate=dspSampleRate(sourceRate);
+    return fitGeq(geqFreqs.map(f=>bands.reduce((sum,b)=>sum+(b.enabled?responseAt(coefficients(b,rate),f,rate):0),0)),rate);
   }
   function computeCrossfeed(s) {
     const freq_hz = Array.from({length:110},(_,i)=>20*1000**(i/109));
@@ -140,7 +160,7 @@
     const input = [base,base-1.8+Math.sin(Date.now()/740)*1.5];
     const preamp = computePEQ(mockSettings).effective_preamp_db;
     const output = input.map(v=>mockRunning?v+preamp:-120);
-    return {running:mockRunning,state:mockRunning?'Running':'Stopped',capture_peak:input,playback_peak:output,capture_rms:input.map(v=>v-8),playback_rms:output.map(v=>v-8),load_percent:mockRunning?2.4+Math.sin(Date.now()/1500)*.5:0,clipped_samples:mockClips,error:null};
+    return {running:mockRunning,state:mockRunning?'Running':'Stopped',sample_rate:mockSettings.sample_rate,chunksize:mockSettings.chunksize,capture_peak:input,playback_peak:output,capture_rms:input.map(v=>v-8),playback_rms:output.map(v=>v-8),load_percent:mockRunning?2.4+Math.sin(Date.now()/1500)*.5:0,clipped_samples:mockClips,error:null};
   }
   function mockResponse() {
     return {settings:clone(mockSettings),capture_devices:[{id:'headphone_dsp_sink.monitor',label:'[Virtual Sink Loopback] Headphone DSP Virtual Input',backend:'Pulse',is_loopback:true,channels:2}],playback_devices:[{id:'plughw:CARD=Generic_1,DEV=0',label:'ALC257 Analog (ALSA Direct)',backend:'Alsa',is_loopback:false,channels:2},{id:'default',label:'System default output',backend:'Pulse',is_loopback:false,channels:2}],profiles:Object.keys(mockProfiles),peq_preview:computePEQ(mockSettings),crossfeed_preview:computeCrossfeed(mockSettings),meters:mockMeters()};
@@ -151,6 +171,21 @@
   }
   function parseAutoEQ(text) {
     const bands = []; let preamp = null;
+    const graphic=text.match(/^\s*GraphicEQ:\s*(.+)$/im);
+    if(graphic) {
+      const points=graphic[1].split(';').map(pair=>pair.trim().split(/\s+/).map(Number));
+      if(points.some(p=>p.length!==2 || !p.every(Number.isFinite) || p[0]<=0)) throw Error('Invalid GraphicEQ frequency / gain pair.');
+      points.sort((a,b)=>a[0]-b[0]);
+      if(points.some((p,i)=>i && p[0]===points[i-1][0])) throw Error('GraphicEQ frequencies must be unique.');
+      const target=geqFreqs.map(f=>{
+        if(f<=points[0][0]) return points[0][1];
+        const hi=points.findIndex(p=>p[0]>=f);
+        if(hi<0) return points.at(-1)[1];
+        const a=points[hi-1],b=points[hi];
+        return a[1]+(b[1]-a[1])*Math.log(f/a[0])/Math.log(b[0]/a[0]);
+      });
+      return {bands:fitGeq(target,dspSampleRate(settings.sample_rate)),preamp:null};
+    }
     const codes = {PK:'bell',PEQ:'bell',LS:'low_shelf',LSC:'low_shelf',HS:'high_shelf',HSC:'high_shelf',HP:'high_pass',HPQ:'high_pass',LP:'low_pass',LPQ:'low_pass',NO:'notch',NOTCH:'notch'};
     const number = '([+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+))';
     for (const raw of text.split(/\r?\n/)) {
@@ -169,22 +204,22 @@
       if (band.freq_hz<20 || band.freq_hz>20000 || Math.abs(band.gain_db)>18 || band.q<.1 || band.q>20) throw Error('Filters must use 20–20,000 Hz, ±18 dB, and Q 0.1–20.');
       bands.push(band);
     }
-    if (!bands.length && preamp === null) throw Error('No supported filters or preamp found. Paste EqualizerAPO / AutoEQ text.');
-    if (bands.length>12) throw Error('A preset can contain at most 12 filters.');
-    return {bands,preamp};
+    if (!bands.length && preamp === null) throw Error('No supported filters or preamp found. Paste AutoEQ filter text.');
+    if (bands.length>128) throw Error('A preset can contain at most 128 filters.');
+    return {bands:normalizeGeq(bands,settings.sample_rate),preamp};
   }
   async function mockInvoke(command,args={}) {
     switch(command) {
       case 'get_live_meters': return mockMeters();
-      case 'update_dsp_settings': mockSettings=clone(args.settings); break;
-      case 'start_engine': mockSettings=clone(args.settings); mockRunning=true; break;
+      case 'update_dsp_settings': mockSettings=automaticPreamp(args.settings); break;
+      case 'start_engine': mockSettings=automaticPreamp(args.settings); mockRunning=true; break;
       case 'stop_engine': mockRunning=false; break;
       case 'save_profile': Object.defineProperty(mockProfiles,args.name,{value:clone(mockSettings),enumerable:true,writable:true,configurable:true}); mockSettings.active_profile=args.name; persistProfiles(); break;
-      case 'load_profile': if (!Object.hasOwn(mockProfiles,args.name)) throw Error('Profile not found.'); mockSettings={...mockSettings,...clone(mockProfiles[args.name]),active_profile:args.name}; break;
+      case 'load_profile': if (!Object.hasOwn(mockProfiles,args.name)) throw Error('Profile not found.'); mockSettings=automaticPreamp({...mockSettings,...mockProfiles[args.name],active_profile:args.name}); break;
       case 'delete_profile': delete mockProfiles[args.name]; if (mockSettings.active_profile===args.name) mockSettings.active_profile='Custom'; persistProfiles(); break;
       case 'import_autoeq': {
         const parsed=parseAutoEQ(args.text); mockSettings.eq_bands=parsed.bands; mockSettings.eq_enabled=true;
-        if(parsed.preamp!==null) { mockSettings.preamp_db=parsed.preamp; mockSettings.auto_preamp=false; }
+        mockSettings.preamp_db=0; mockSettings.auto_preamp=true;
         mockSettings.active_profile='Imported AutoEQ'; break;
       }
       case 'export_autoeq': {
@@ -236,58 +271,50 @@
   }
   function renderSettings() {
     $('crossfeed-enabled').checked=settings.crossfeed_enabled;
-    $('eq-enabled').checked=settings.eq_enabled; $('auto-preamp').checked=settings.auto_preamp;
-    setRange('angle',settings.crossfeed_angle_deg); setRange('mid',settings.crossfeed_mid_boost_db); setRange('preamp',settings.preamp_db);
-    $('sample-rate').value=settings.sample_rate; $('chunksize').value=settings.chunksize; $('exclusive').checked=settings.exclusive_mode;
+    $('eq-enabled').checked=settings.eq_enabled;
+    setRange('angle',settings.crossfeed_angle_deg); setRange('mid',settings.crossfeed_mid_boost_db);
+    $('exclusive').checked=settings.exclusive_mode;
     updateLabels(); renderDevices(); renderProfiles(); renderBands();
   }
   function updateLabels() {
     $('angle-value').innerHTML=`${settings.crossfeed_angle_deg.toFixed(0)}<span>°</span>`;
     $('mid-value').innerHTML=`${settings.crossfeed_mid_boost_db.toFixed(1)} <span>dB</span>`;
-    $('preamp-value').innerHTML=`${signed(settings.preamp_db)} <span>dB</span>`;
     $('bypass').setAttribute('aria-pressed',String(settings.master_bypass)); $('bypass-label').textContent=settings.master_bypass?'Original signal':'DSP active';
     $('hw-vol').setAttribute('aria-pressed',String(!!settings.hw_volume_bypass)); $('hw-vol-label').textContent=settings.hw_volume_bypass?'Fixed 0 dB':'OS Vol';
     $('bypass-overlay').hidden=!settings.master_bypass;
-    $('auto-label').textContent=settings.auto_preamp?'Auto-preamp on':'Manual gain · anti-clip off';
-    $('headroom-status').textContent=settings.auto_preamp?'ANTI-CLIP':'MANUAL';
-    $('headroom-status').style.color=settings.auto_preamp?'var(--ok)':'var(--warn)';
     $('crossfeed-card').classList.toggle('processing-off',!settings.crossfeed_enabled);
     $('exclusive-wrap').hidden=!(settings.capture_backend.toLowerCase()==='wasapi'||settings.playback_backend.toLowerCase()==='wasapi');
-    $('latency').textContent=`${settings.sample_rate/1000} kHz / ${settings.chunksize} samples`;
-    $('routing-summary').textContent=`${settings.sample_rate/1000} kHz · ${settings.chunksize} samples · ${(settings.chunksize/settings.sample_rate*1000).toFixed(1)} ms buffer`;
+    const dspRate = dspSampleRate(settings.sample_rate);
+    $('latency').textContent=`${formatRate(settings.sample_rate)} · ${settings.chunksize} samples · ${(settings.chunksize/dspRate*1000).toFixed(1)} ms buffer`;
     document.querySelectorAll('[data-angle]').forEach(el=>el.classList.toggle('active',Number(el.dataset.angle)===settings.crossfeed_angle_deg));
   }
   function renderBands() {
-    $('band-rows').innerHTML=settings.eq_bands.map((b,i)=>{
-      const gainDisabled=!gainTypes.has(b.band_type);
-      const cell=(key,min,max,step,log=false,disabled=false)=>`<td><input type="number" data-band="${i}" data-key="${key}" value="${key==='q'?Number(b[key].toFixed(3)):Number(b[key].toFixed(2))}" min="${min}" max="${max}" step="${step}" aria-label="Band ${i+1} ${key==='freq_hz'?'frequency in Hz':key==='gain_db'?'gain in dB':'Q'}" ${disabled?'disabled':''}><input type="range" data-band="${i}" data-key="${key}" ${log?'data-log="true"':''} min="${log?0:min}" max="${log?1000:max}" step="${log?1:step}" value="${log?Math.log(b[key]/min)/Math.log(max/min)*1000:b[key]}" aria-label="Band ${i+1} ${key} slider" ${disabled?'disabled':''}></td>`;
-      return `<tr data-row="${i}" class="${b.enabled?'':'band-disabled'} ${selectedBand===i?'selected':''}"><td><button class="band-toggle" data-enable="${i}" style="--band-color:${colors[i]}" aria-label="Enable band ${i+1}" aria-pressed="${b.enabled}">${i+1}</button></td><td><select data-band="${i}" data-key="band_type" aria-label="Band ${i+1} filter type">${Object.entries(types).map(([key,label])=>`<option value="${key}" ${b.band_type===key?'selected':''}>${label}</option>`).join('')}</select></td>${cell('freq_hz',20,20000,1,true)}${cell('gain_db',-18,18,.1,false,gainDisabled)}${cell('q',.1,20,.01,true)}<td><button class="remove" data-remove="${i}" aria-label="Remove band ${i+1}" title="Remove band ${i+1}">×</button></td></tr>`;
-    }).join('');
-    $('band-rows').querySelectorAll('input[type=range]').forEach(fillRange);
-    $('band-count').textContent=`${settings.eq_bands.length} / 12 bands`;
-    $('add-band').disabled=settings.eq_bands.length>=12 || !ready;
-    $('empty-bands').hidden=!!settings.eq_bands.length;
+    $('band-rows').innerHTML=settings.eq_bands.map((b,i)=>`<div class="geq-column" data-row="${i}" style="--band-color:${colors[i]}"><input type="number" class="geq-num" data-band="${i}" value="${b.gain_db.toFixed(1)}" min="-6" max="6" step="0.1" aria-label="${geqFreqs[i]} Hz gain in dB"><div class="geq-fader" data-fader="${i}" tabindex="0" role="slider" aria-label="${geqFreqs[i]} Hz fader" aria-orientation="vertical" aria-valuemin="-6" aria-valuemax="6" aria-valuenow="${b.gain_db.toFixed(1)}">${[6,3,0,-3,-6].map(v=>`<span class="geq-tick ${v===0?'zero':''}" style="top:${(6-v)/12*100}%" aria-hidden="true"><small>${v>0?'+':''}${v}</small></span>`).join('')}<i class="geq-fill" aria-hidden="true"></i><b class="geq-cap" aria-hidden="true"></b></div><span class="geq-freq">${geqLabels[i]}<small>Hz</small></span></div>`).join('');
+    settings.eq_bands.forEach((_,i)=>syncBandRow(i));
+    $('band-count').textContent='10-Band ISO · Q 1.41';
   }
   function syncBandRow(index) {
     const b=settings.eq_bands[index]; if(!b) return;
-    $('band-rows').querySelectorAll(`[data-band="${index}"]`).forEach(el=>{
-      const key=el.dataset.key; if(key==='band_type') return;
-      if(el===document.activeElement && el.type==='number') return;
-      el.value=el.dataset.log ? Math.log(b[key]/(key==='q'?.1:20))/Math.log(key==='q'?200:1000)*1000 : Number(b[key].toFixed(key==='q'?3:2));
-      if(el.type==='range') fillRange(el);
-    });
+    const row=$('band-rows').querySelector(`[data-row="${index}"]`); if(!row) return;
+    const input=row.querySelector('input'),fader=row.querySelector('.geq-fader'),position=(6-clamp(b.gain_db,-geqMaxGain,geqMaxGain))/12*100;
+    if(document.activeElement!==input) input.value=b.gain_db.toFixed(1);
+    fader.setAttribute('aria-valuenow',b.gain_db.toFixed(1));
+    fader.setAttribute('aria-valuetext',`${signed(b.gain_db)} dB`);
+    fader.querySelector('.geq-cap').style.top=`${position}%`;
+    const fill=fader.querySelector('.geq-fill');fill.style.top=`${Math.min(50,position)}%`;fill.style.height=`${Math.abs(position-50)}%`;
+    row.classList.toggle('selected',selectedBand===index);
   }
-  const graph={width:800,height:300,left:45,right:778,top:15,bottom:267};
+  const graph={width:800,height:136,left:52,right:778,top:14,bottom:110};
   const gx=f=>graph.left+Math.log10(clamp(f,20,20000)/20)/3*(graph.right-graph.left);
-  const gy=db=>graph.top+(18-clamp(db,-24,24))/36*(graph.bottom-graph.top);
+  const gy=db=>graph.top+(12-clamp(db,-14,14))/24*(graph.bottom-graph.top);
   function pathFor(freq,values,x=gx,y=gy) { return freq.map((f,i)=>`${i?'L':'M'}${x(f).toFixed(2)},${y(Number.isFinite(values[i])?values[i]:0).toFixed(2)}`).join(' '); }
   function renderEQ(preview) {
     if(!preview?.freq_hz?.length) return;
-    const ticks=[20,50,100,200,500,1000,2000,5000,10000,20000], levels=[-18,-12,-6,0,6,12,18];
-    let html='<defs><linearGradient id="eq-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#b98af0" stop-opacity=".2"/><stop offset="100%" stop-color="#b98af0" stop-opacity=".015"/></linearGradient><clipPath id="plot-clip"><rect x="45" y="15" width="733" height="252"/></clipPath></defs>';
-    levels.forEach(db=>{const y=gy(db);html+=`<line x1="45" x2="778" y1="${y}" y2="${y}" stroke="${db===0?'#83899775':'#ffffff09'}" ${db===0?'stroke-dasharray="3 5"':''}/><text x="33" y="${y+3}" text-anchor="end" fill="#838997" font-size="11">${db>0?'+':''}${db}</text>`;});
-    ticks.forEach(f=>{const x=gx(f);html+=`<line x1="${x}" x2="${x}" y1="15" y2="267" stroke="#ffffff08"/><text x="${x}" y="287" text-anchor="middle" fill="#838997" font-size="11">${f>=1000?`${f/1000}k`:f}</text>`;});
-    html+='<text x="14" y="7" fill="#838997" font-size="11">dB</text><g clip-path="url(#plot-clip)">';
+    const ticks=[20,50,100,200,500,1000,2000,5000,10000,20000], levels=[-12,-6,0,6,12];
+    let html='<defs><linearGradient id="eq-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#b98af0" stop-opacity=".2"/><stop offset="100%" stop-color="#b98af0" stop-opacity=".015"/></linearGradient><clipPath id="plot-clip"><rect x="52" y="14" width="726" height="96"/></clipPath></defs>';
+    levels.forEach(db=>{const y=gy(db);html+=`<line x1="52" x2="778" y1="${y}" y2="${y}" stroke="${db===0?'#83899775':'#ffffff09'}" ${db===0?'stroke-dasharray="3 5"':''}/><text x="42" y="${y+3.5}" text-anchor="end" fill="#838997" font-size="11">${db>0?'+':''}${db}</text>`;});
+    ticks.forEach(f=>{const x=gx(f);html+=`<line x1="${x}" x2="${x}" y1="14" y2="110" stroke="#ffffff08"/><text x="${x}" y="128" text-anchor="middle" fill="#838997" font-size="11">${f>=1000?`${f/1000}k`:f}</text>`;});
+    html+='<text x="6" y="65.5" fill="#838997" font-size="10">dB</text><g clip-path="url(#plot-clip)">';
     const compositePath=pathFor(preview.freq_hz,preview.composite_db);
     html+=`<path d="${compositePath} L${gx(20000)},${gy(0)} L${gx(20)},${gy(0)} Z" fill="url(#eq-fill)"/>`;
     (preview.per_band_db||[]).forEach((values,i)=>{if(settings.eq_bands[i]?.enabled && settings.eq_enabled) html+=`<path d="${pathFor(preview.freq_hz,values)}" fill="none" stroke="${colors[i]}" stroke-width="1.15" opacity="${selectedBand===i?.7:.3}"/>`;});
@@ -298,8 +325,8 @@
       html+=`<g class="handle" data-handle="${i}" opacity="${settings.eq_enabled?1:.4}"><circle cx="${x}" cy="${y}" r="19" fill="transparent"/>${selectedBand===i?`<circle cx="${x}" cy="${y}" r="14" fill="${colors[i]}" opacity=".12"/>`:''}<circle cx="${x}" cy="${y}" r="9" fill="#171b22" stroke="${colors[i]}" stroke-width="1.5"/><text x="${x}" y="${y+3}" text-anchor="middle" fill="${colors[i]}" font-size="11" pointer-events="none">${i+1}</text></g>`;
     });
     $('eq-graph').innerHTML=html;
-    $('peak').innerHTML=`${signed(preview.raw_peak_db||0)} <small>dB</small>`;
-    $('effective').innerHTML=`${signed(preview.effective_preamp_db||0)} <small>dB</small>`;
+    $('peak').textContent=`${signed(preview.raw_peak_db||0)} dB`;
+    $('effective').textContent=`${signed(preview.effective_preamp_db||0)} dB`;
     $('effective').style.color=preview.effective_preamp_db+(preview.raw_peak_db||0)>0?'var(--warn)':'var(--ok)';
   }
   function renderStage() {
@@ -321,23 +348,26 @@
   function renderMeters(meters) {
     if(!meters) return;
     state.meters=meters;
-    for(const [id,peakKey,rmsKey] of [['input-meters','capture_peak','capture_rms'],['output-meters','playback_peak','playback_rms']]) {
-      const peaks=meters[peakKey]||[-120,-120], rms=meters[rmsKey]||peaks;
-      $(id).querySelectorAll('.stereo i').forEach((bar,i)=>{
-        const db=meters.running ? (peaks[i]??-120) : -120;
-        bar.querySelector('b').style.width=`${clamp((db+60)/60*100,0,100)}%`;
-        bar.querySelector('em').style.left=`${clamp(((meters.running?rms[i]:-120)+60)/60*100,0,100)}%`;
-        bar.title=`${i?'R':'L'} peak ${db.toFixed(1)} dBFS · RMS ${(rms[i]??-120).toFixed(1)} dBFS`;
-      });
-      const max=meters.running?Math.max(...peaks):-120;
-      $(id).querySelector('output').textContent=max<=-100?'−∞':max.toFixed(0);
-      $(id).setAttribute('aria-label',`${id==='input-meters'?'Input':'Output'} peak ${max<=-100?'silent':max.toFixed(1)+' dBFS'}`);
+    if(Number.isFinite(meters.sample_rate) && meters.sample_rate > 0 &&
+      (meters.sample_rate !== settings.sample_rate || (Number.isFinite(meters.chunksize) && meters.chunksize > 0 && meters.chunksize !== settings.chunksize))) {
+      settings.sample_rate=meters.sample_rate;
+      if(Number.isFinite(meters.chunksize) && meters.chunksize > 0) settings.chunksize=meters.chunksize;
+      updateLabels(); requestDraw();
     }
+    const peaks=meters.playback_peak||[-120,-120], rms=meters.playback_rms||peaks;
+    $('output-meters').querySelectorAll('.stereo i').forEach((bar,i)=>{
+      const db=meters.running ? (peaks[i]??-120) : -120;
+      bar.querySelector('b').style.width=`${clamp((db+60)/60*100,0,100)}%`;
+      bar.querySelector('em').style.left=`${clamp(((meters.running?rms[i]:-120)+60)/60*100,0,100)}%`;
+      bar.title=`${i?'R':'L'} peak ${db.toFixed(1)} dBFS · RMS ${(rms[i]??-120).toFixed(1)} dBFS`;
+    });
+    const max=meters.running?Math.max(...peaks):-120;
+    $('output-meters').setAttribute('aria-label',`Output peak ${max<=-100?'silent':max.toFixed(1)+' dBFS'}`);
     $('cpu').textContent=`${Number(meters.load_percent||0).toFixed(1)}%`;
     const clips=Number(meters.clipped_samples||0); if(clips<clipAcknowledged) clipAcknowledged=0;
     $('clip').classList.toggle('is-clipped',clips>clipAcknowledged); $('clip').querySelector('span').textContent=clips.toLocaleString();
     $('clip').title=`${clips} clipped samples. Click to acknowledge the warning.`;
-    $('engine-status').textContent=meters.error?'● Engine error':meters.running?`● Running ${settings.sample_rate/1000} kHz`:`● ${meters.state||'Stopped'}`;
+    $('engine-status').textContent=meters.error?'● Engine error':meters.running?`● Running ${formatRate(settings.sample_rate)}`:`● ${meters.state||'Stopped'}`;
     $('engine-status').className=`status ${meters.error?'error':meters.running?'running':''}`;
     $('engine').innerHTML=meters.running?'Stop DSP <span>■</span>':'Start DSP <span>▶</span>';
     $('engine').disabled=!ready || engineBusy;
@@ -360,9 +390,10 @@
     if(!response?.settings) throw Error('The audio engine returned an incomplete state.');
     // Never overwrite newer local edits with a slower backend response.
     if(expectedRevision!==revision) { renderMeters(response.meters); return; }
-    state=response; settings=clone(response.settings);
+    state=response; settings=automaticPreamp(response.settings);
     if(full) renderSettings(); else { updateLabels(); syncAllBandRows(); }
-    renderEQ(response.peq_preview||computePEQ(settings)); renderStage(); renderCross(response.crossfeed_preview||computeCrossfeed(settings));
+    const automatic=response.settings.auto_preamp===true && response.settings.preamp_db===0 && JSON.stringify(response.settings.eq_bands)===JSON.stringify(settings.eq_bands);
+    renderEQ((automatic && response.peq_preview)||computePEQ(settings)); renderStage(); renderCross(response.crossfeed_preview||computeCrossfeed(settings));
     renderMeters(response.meters);
     $('sync-status').textContent=previewMode?'Preview · changes simulated locally':'All changes applied';
   }
@@ -404,14 +435,13 @@
   }
 
   // Global controls: local feedback first, ordered/debounced audio updates second.
-  [['angle','crossfeed_angle_deg'],['mid','crossfeed_mid_boost_db'],['preamp','preamp_db']].forEach(([id,key])=>{
+  [['angle','crossfeed_angle_deg'],['mid','crossfeed_mid_boost_db']].forEach(([id,key])=>{
     $(id).addEventListener('input',event=>{settings[key]=Number(event.target.value);fillRange(event.target);edited();});
   });
-  [['crossfeed-enabled','crossfeed_enabled'],['eq-enabled','eq_enabled'],['auto-preamp','auto_preamp'],['exclusive','exclusive_mode']].forEach(([id,key])=>$(id).addEventListener('change',event=>{settings[key]=event.target.checked;edited();}));
+  [['crossfeed-enabled','crossfeed_enabled'],['eq-enabled','eq_enabled'],['exclusive','exclusive_mode']].forEach(([id,key])=>$(id).addEventListener('change',event=>{settings[key]=event.target.checked;edited();}));
   $('bypass').addEventListener('click',()=>{settings.master_bypass=!settings.master_bypass;edited();});
   $('hw-vol').addEventListener('click',()=>{settings.hw_volume_bypass=!settings.hw_volume_bypass;edited();toast(settings.hw_volume_bypass?'Hardware volume mode: OS volume locked to 100% (0 dB).':'OS software volume control restored.');});
   $('angle-presets').addEventListener('click',event=>{const button=event.target.closest('[data-angle]');if(button){settings.crossfeed_angle_deg=Number(button.dataset.angle);setRange('angle',settings.crossfeed_angle_deg);edited();}});
-  [['sample-rate','sample_rate'],['chunksize','chunksize']].forEach(([id,key])=>$(id).addEventListener('change',event=>{settings[key]=Number(event.target.value);edited();}));
   ['capture','playback'].forEach(direction=>$(direction).addEventListener('change',event=>{
     const device=(state[`${direction}_devices`]||[]).find(d=>d.id===event.target.value); if(!device) return;
     settings[`${direction}_device`]=device.id; settings[`${direction}_backend`]=device.backend;
@@ -429,46 +459,66 @@
     finally {engineBusy=false; $('engine').disabled=!ready;}
   });
   $('clip').addEventListener('click',()=>{clipAcknowledged=state?.meters?.clipped_samples||0; $('clip').classList.remove('is-clipped');});
-  $('add-band').addEventListener('click',()=>{
-    if(settings.eq_bands.length>=12) return;
-    settings.eq_bands.push({enabled:true,band_type:'bell',freq_hz:1000,gain_db:0,q:1}); selectedBand=settings.eq_bands.length-1;
-    edited({bands:true}); $('band-rows').lastElementChild?.scrollIntoView({block:'nearest'});
-  });
   $('reset').addEventListener('click',()=>{
-    settings.eq_bands.forEach(b=>{b.gain_db=0;if(!gainTypes.has(b.band_type)) b.enabled=false;});
-    edited({bands:true});toast('EQ flattened. Band positions are kept; pass and notch filters are disabled.');
+    settings.eq_bands=makeGeqBands();
+    edited({bands:true});toast('Graphic EQ flattened to 0.0 dB.');
   });
-  $('band-rows').addEventListener('click',event=>{
-    const toggle=event.target.closest('[data-enable]'),remove=event.target.closest('[data-remove]');
-    if(toggle) {const index=Number(toggle.dataset.enable);settings.eq_bands[index].enabled=!settings.eq_bands[index].enabled;selectedBand=index;edited({bands:true});}
-    if(remove) {settings.eq_bands.splice(Number(remove.dataset.remove),1);selectedBand=-1;edited({bands:true});}
-  });
+  function setBandGain(index,value) {
+    if(!ready || !settings.eq_bands[index] || !Number.isFinite(value)) return;
+    selectedBand=index;settings.eq_bands[index].gain_db=Math.round(clamp(value,-geqMaxGain,geqMaxGain)*10)/10;
+    syncAllBandRows();selectInfo(index);edited();
+  }
   function bandInput(event) {
-    const el=event.target,index=Number(el.dataset.band),key=el.dataset.key;
-    if(!key || !settings.eq_bands[index]) return;
-    selectedBand=index;
-    if(key==='band_type') {if(event.type!=='change') return;settings.eq_bands[index][key]=el.value;edited({bands:true});return;}
-    if(event.type==='change' && el.type==='range') return;
+    const el=event.target,index=Number(el.dataset.band);
+    if(!el.matches('.geq-num') || !settings.eq_bands[index]) return;
     const value=Number(el.value);
-    if(el.value.trim()==='' || !Number.isFinite(value) || value<Number(el.min) || value>Number(el.max)) {
-      if(event.type==='change') {el.value=settings.eq_bands[index][key];el.setCustomValidity('');} return;
+    if(el.value.trim()==='' || !Number.isFinite(value) || value < -geqMaxGain || value > geqMaxGain) {
+      if(event.type==='change') el.value=settings.eq_bands[index].gain_db.toFixed(1);return;
     }
-    const next=el.dataset.log ? (key==='q'?.1:20)*(key==='q'?200:1000)**(value/1000) : value;
-    settings.eq_bands[index][key]=key==='freq_hz'?Math.round(next):Math.round(next*1000)/1000;
-    syncBandRow(index);if(el.type==='range')fillRange(el);edited();
+    setBandGain(index,value);
   }
   $('band-rows').addEventListener('input',bandInput);$('band-rows').addEventListener('change',bandInput);
   $('band-rows').addEventListener('focusin',event=>{const row=event.target.closest('[data-row]');if(row){selectedBand=Number(row.dataset.row);requestDraw();}});
+  let faderDrag=null;
+  function moveFader(event) {
+    if(!faderDrag || event.pointerId!==faderDrag.pointerId) return;
+    const rect=faderDrag.el.getBoundingClientRect();
+    setBandGain(faderDrag.index,6-(event.clientY-rect.top)/rect.height*12);
+  }
+  $('band-rows').addEventListener('pointerdown',event=>{
+    const el=event.target.closest('[data-fader]');if(!el || !ready || event.button!==0) return;
+    event.preventDefault();el.focus();faderDrag={el,index:Number(el.dataset.fader),pointerId:event.pointerId};
+    el.setPointerCapture(event.pointerId);moveFader(event);
+  });
+  $('band-rows').addEventListener('pointermove',moveFader);
+  ['pointerup','pointercancel','lostpointercapture'].forEach(name=>$('band-rows').addEventListener(name,event=>{
+    if(!faderDrag || faderDrag.pointerId!==event.pointerId) return;
+    const {el,pointerId}=faderDrag;faderDrag=null;
+    if(el.hasPointerCapture(pointerId)) el.releasePointerCapture(pointerId);
+    if(updateTimer) sendUpdate();
+  }));
+  $('band-rows').addEventListener('dblclick',event=>{
+    const el=event.target.closest('[data-fader]');if(el) setBandGain(Number(el.dataset.fader),0);
+  });
+  $('band-rows').addEventListener('wheel',event=>{
+    const el=event.target.closest('[data-fader]');if(!el || event.ctrlKey || event.metaKey || !event.deltaY) return;
+    event.preventDefault();const i=Number(el.dataset.fader);setBandGain(i,settings.eq_bands[i].gain_db+(event.deltaY<0?.5:-.5));
+  },{passive:false});
+  $('band-rows').addEventListener('keydown',event=>{
+    const el=event.target.closest('[data-fader]');if(!el || event.ctrlKey || event.metaKey || event.altKey) return;
+    const steps={ArrowUp:.5,ArrowDown:-.5,PageUp:2,PageDown:-2},i=Number(el.dataset.fader);
+    if(Object.hasOwn(steps,event.key)) {event.preventDefault();setBandGain(i,settings.eq_bands[i].gain_db+steps[event.key]);}
+    else if(['0','Delete','Backspace'].includes(event.key)) {event.preventDefault();setBandGain(i,0);}
+  });
 
   // SVG drag math is independent of CSS pixel size, including non-uniform resizing.
   function graphPoint(event) {
     const rect=$('eq-graph').getBoundingClientRect();
-    return {x:(event.clientX-rect.left)/rect.width*800,y:(event.clientY-rect.top)/rect.height*300};
+    return {x:(event.clientX-rect.left)/rect.width*800,y:(event.clientY-rect.top)/rect.height*136};
   }
   function selectInfo(index) {
     const b=settings.eq_bands[index]; if(!b) return;
-    const freq=b.freq_hz>=1000?`${(b.freq_hz/1000).toFixed(2)} kHz`:`${b.freq_hz.toFixed(0)} Hz`;
-    const info=`Band ${index+1} · ${freq}${gainTypes.has(b.band_type)?` · ${signed(b.gain_db)} dB`:''} · Q ${b.q.toFixed(2)}`;
+    const info=`${geqLabels[index]||`${b.freq_hz.toFixed(0)}`} Hz · ${signed(b.gain_db)} dB`;
     $('selected-info').textContent=info; $('graph-tooltip').textContent=info;
   }
   $('eq-graph').addEventListener('pointerdown',event=>{
@@ -479,8 +529,7 @@
   $('eq-graph').addEventListener('pointermove',event=>{
     if(!drag || drag.pointerId!==event.pointerId) return;
     const point=graphPoint(event),b=settings.eq_bands[drag.index]; if(!b) return;
-    b.freq_hz=Math.round(20*1000**clamp((point.x-graph.left)/(graph.right-graph.left),0,1));
-    if(gainTypes.has(b.band_type)) b.gain_db=Math.round(clamp(18-(point.y-graph.top)/(graph.bottom-graph.top)*36,-18,18)*10)/10;
+    b.gain_db=Math.round(clamp(12-(point.y-graph.top)/(graph.bottom-graph.top)*24,-geqMaxGain,geqMaxGain)*10)/10;
     syncBandRow(drag.index);selectInfo(drag.index);edited();
   });
   function finishDrag(event) {
@@ -491,11 +540,14 @@
   }
   ['pointerup','pointercancel','lostpointercapture'].forEach(name=>$('eq-graph').addEventListener(name,finishDrag));
   $('eq-graph').addEventListener('wheel',event=>{
-    const handle=event.target.closest('[data-handle]');if(!handle || !ready)return;
+    const handle=event.target.closest('[data-handle]');if(!handle || !ready || event.ctrlKey || event.metaKey || !event.deltaY)return;
     event.preventDefault();selectedBand=Number(handle.dataset.handle);const b=settings.eq_bands[selectedBand];
-    b.q=Math.round(clamp(b.q*(event.deltaY<0?1.08:1/1.08),.1,20)*100)/100;
+    b.gain_db=Math.round(clamp(b.gain_db+(event.deltaY<0?.5:-.5),-geqMaxGain,geqMaxGain)*10)/10;
     syncBandRow(selectedBand);selectInfo(selectedBand);edited();
   },{passive:false});
+  $('eq-graph').addEventListener('dblclick',event=>{
+    const handle=event.target.closest('[data-handle]');if(handle) setBandGain(Number(handle.dataset.handle),0);
+  });
 
   // Native dialog elements provide keyboard focus trapping and Escape dismissal.
   document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>button.closest('dialog').close()));
@@ -503,7 +555,7 @@
   function openProfile(actionType) {
     profileAction=actionType;$('profile-error').textContent='';const deleting=actionType==='delete';
     $('profile-dialog-title').textContent=deleting?'Delete profile?':'Save listening profile';
-    $('profile-description').textContent=deleting?'This removes the saved profile. Your current listening settings will stay unchanged.':'Keep your EQ, crossfeed and gain settings together. An existing name will replace that saved profile.';
+    $('profile-description').textContent=deleting?'This removes the saved profile. Your current listening settings will stay unchanged.':'Keep your EQ and crossfeed settings together. An existing name will replace that saved profile.';
     $('profile-name').value=deleting?settings.active_profile:'';$('profile-name').readOnly=deleting;
     $('profile-submit').textContent=deleting?'Delete profile':'Save profile';
     $('profile-submit').style.background=deleting?'var(--danger)':'';$('profile-dialog').showModal();
@@ -524,15 +576,20 @@
     catch(error){report(error);renderProfiles();}finally{$('profiles').disabled=false;}
   });
   $('autoeq').addEventListener('click',()=>{$('autoeq-error').textContent='';$('autoeq-dialog').showModal();});
+  $('autoeq-search-link').addEventListener('click',event=>{
+    if(previewMode) return;
+    event.preventDefault();
+    invoke('open_external_url', { url: 'https://autoeq.app' }).catch(report);
+  });
   $('export').addEventListener('click',async()=>{
     $('export').disabled=true;
     try {const response=await action('export_autoeq',{},false);$('autoeq-text').value=response.text;$('autoeq-error').textContent='';toast('Current EQ exported. Ready to copy.');}
     catch(error){$('autoeq-error').textContent=error?.message||String(error);}finally{$('export').disabled=false;}
   });
   $('import').addEventListener('click',async()=>{
-    const text=$('autoeq-text').value.trim();if(!text){$('autoeq-error').textContent='Paste an AutoEQ / EqualizerAPO preset first.';return;}
+    const text=$('autoeq-text').value.trim();if(!text){$('autoeq-error').textContent='Paste an AutoEQ preset first.';return;}
     $('import').disabled=true;
-    try {await action('import_autoeq',{text});selectedBand=-1;$('dirty').hidden=false;$('autoeq-dialog').close();toast('AutoEQ imported. Your previous EQ has been replaced.');}
+    try {await action('import_autoeq',{text});selectedBand=-1;$('dirty').hidden=false;$('autoeq-dialog').close();toast('AutoEQ imported into 10-band Graphic EQ.');}
     catch(error){$('autoeq-error').textContent=error?.message||String(error);}finally{$('import').disabled=false;}
   });
   $('copy').addEventListener('click',async()=>{

@@ -24,10 +24,12 @@ use crate::crossfeed::{
     CrossfeedPreview,
 };
 use crate::devices::{canonical_backend, AudioDeviceInfo, BACKEND_ALSA, BACKEND_PULSE};
-use crate::peq::{compute_peq_response, EqBand, PeqResponse, MAX_BANDS};
+use crate::peq::{
+    compute_peq_response, default_geq_bands, normalize_geq_bands, EqBand, PeqResponse, MAX_BANDS,
+};
 
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
-pub const DEFAULT_CHUNKSIZE: usize = 2048;
+pub const DEFAULT_CHUNKSIZE: usize = 512;
 /// First-run crossfeed angle and Mid boost, as the UI defaults them (the
 /// Python port's own defaults differ: 30° and 9 dB).
 pub const UI_DEFAULT_CROSSFEED_ANGLE_DEG: f64 = 35.0;
@@ -66,11 +68,7 @@ impl Default for DspSettings {
             auto_preamp: true,
             master_bypass: false,
             eq_enabled: true,
-            eq_bands: vec![
-                EqBand::new("low_shelf", 105.0, 4.0, 0.71),
-                EqBand::new("bell", 1000.0, 0.0, 1.0),
-                EqBand::new("high_shelf", 8000.0, -1.5, 0.71),
-            ],
+            eq_bands: default_geq_bands([3.5, 3.0, 1.5, 0.0, 0.0, 0.0, 0.0, -0.5, -1.5, -1.5]),
         }
     }
 }
@@ -306,11 +304,21 @@ impl Store {
     }
 
     /// Load persisted settings; a missing or corrupt file yields defaults.
+    /// The chunk size is backend-owned: any stored value is replaced, which
+    /// migrates older `settings.json` files to [`DEFAULT_CHUNKSIZE`]. Preamp is
+    /// backend-owned too: it is always automatic anti-clip (`preamp_db = 0`).
+    /// The EQ is canonicalized to the 10-band Graphic EQ.
     pub fn load_settings(&self) -> AppSettings {
-        std::fs::read_to_string(self.settings_path())
+        let mut settings = std::fs::read_to_string(self.settings_path())
             .ok()
             .and_then(|text| serde_json::from_str::<AppSettings>(&text).ok())
             .unwrap_or_default()
+            .sanitized();
+        settings.chunksize = DEFAULT_CHUNKSIZE;
+        settings.auto_preamp = true;
+        settings.preamp_db = 0.0;
+        settings.eq_bands = normalize_geq_bands(&settings.eq_bands);
+        settings
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<(), String> {
@@ -359,7 +367,7 @@ impl Store {
             serde_json::from_str(&text).map_err(|e| format!("profile '{}' is corrupt: {e}", name.trim()))?;
         Ok(Profile {
             name: profile.name,
-            dsp: profile.dsp.sanitized(),
+            dsp: canonical_dsp(&profile.dsp),
         })
     }
 
@@ -367,7 +375,7 @@ impl Store {
         let name = normalize_profile_name(name)?;
         self.write_profile(&Profile {
             name,
-            dsp: dsp.sanitized(),
+            dsp: canonical_dsp(dsp),
         })
     }
 
@@ -389,6 +397,13 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     }
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("serializing: {e}"))?;
     std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Sanitize DSP settings and canonicalize the EQ to the 10-band Graphic EQ.
+fn canonical_dsp(dsp: &DspSettings) -> DspSettings {
+    let mut out = dsp.sanitized();
+    out.eq_bands = normalize_geq_bands(&out.eq_bands);
+    out
 }
 
 fn normalize_profile_name(name: &str) -> Result<String, String> {
@@ -428,50 +443,45 @@ pub fn builtin_profiles() -> Vec<Profile> {
             name: "Flat / Neutral".to_string(),
             dsp: DspSettings {
                 crossfeed_enabled: false,
-                eq_bands: Vec::new(),
+                eq_bands: default_geq_bands([0.0; crate::peq::GEQ_BAND_COUNT]),
                 ..base.clone()
             },
         },
         Profile {
             name: "Warm Vocal & Sub-Bass".to_string(),
             dsp: DspSettings {
-                eq_bands: vec![
-                    EqBand::new("low_shelf", 85.0, 4.5, 0.71),
-                    EqBand::new("bell", 1800.0, 1.5, 1.1),
-                    EqBand::new("high_shelf", 7500.0, -2.0, 0.71),
-                ],
+                eq_bands: default_geq_bands([4.0, 3.5, 2.0, 0.5, 0.0, 1.0, 1.5, 0.0, -1.5, -2.0]),
                 ..base.clone()
             },
         },
         Profile {
             name: "HD 650 / 6XX Harman Target".to_string(),
             dsp: DspSettings {
-                eq_bands: vec![
-                    EqBand::new("low_shelf", 105.0, 5.5, 0.71),
-                    EqBand::new("bell", 3100.0, -2.2, 1.8),
-                    EqBand::new("high_shelf", 9000.0, 2.0, 0.71),
-                ],
+                eq_bands: default_geq_bands([5.0, 4.0, 2.0, 0.0, 0.0, 0.0, -1.0, -2.0, 1.5, 2.0]),
                 ..base
             },
         },
     ]
 }
 
-/// Preview curves for the DSP settings, evaluated at `sample_rate`.
+/// Preview curves for the DSP settings, evaluated at the DSP rate.
 ///
+/// `sample_rate` is the source rate; the DSP runs at its KU100 base rate
+/// (44.1 or 48 kHz), so the curves are evaluated there to match the pipeline.
 /// Mirrors the UI's own preview model: master bypass shows the EQ curve but
 /// no preamp, and disabled crossfeed reports zeros.
 pub fn compute_curves(dsp: &DspSettings, sample_rate: u32) -> (PeqResponse, CrossfeedPreview) {
+    let dsp_rate = crate::crossfeed::ku100_base_sample_rate(sample_rate);
     let (preamp, auto) = if dsp.master_bypass {
         (0.0, false)
     } else {
         (dsp.preamp_db, dsp.auto_preamp)
     };
-    let eq = compute_peq_response(&dsp.eq_bands, preamp, auto, sample_rate, dsp.eq_enabled);
+    let eq = compute_peq_response(&dsp.eq_bands, preamp, auto, dsp_rate, dsp.eq_enabled);
 
     let mut crossfeed = compute_crossfeed_preview(
         dsp.crossfeed_angle_deg,
-        sample_rate,
+        dsp_rate,
         dsp.crossfeed_mid_boost_db,
     );
     if !dsp.crossfeed_enabled {
@@ -497,13 +507,14 @@ mod tests {
     fn app_settings_defaults_match_ui_defaults() {
         let s = AppSettings::default();
         assert_eq!(s.sample_rate, 48_000);
-        assert_eq!(s.chunksize, 2048);
+        assert_eq!(s.chunksize, 512);
         assert_eq!(s.crossfeed_angle_deg, 35.0);
         assert_eq!(s.crossfeed_mid_boost_db, 3.0);
         assert!(s.eq_enabled);
         assert_eq!(s.active_profile, "Default");
-        assert_eq!(s.eq_bands.len(), 3);
-        assert_eq!(s.eq_bands[0].band_type, "low_shelf");
+        assert_eq!(s.eq_bands.len(), 10);
+        assert_eq!(s.eq_bands[0].band_type, "bell");
+        assert_eq!(s.eq_bands[0].freq_hz, 31.0);
     }
 
     #[test]
@@ -592,7 +603,14 @@ mod tests {
         store.save_profile("  My Cans/../x  ", &dsp).unwrap();
         assert!(store.list_profiles().contains(&"My Cans/../x".to_string()));
         let loaded = store.load_profile("My Cans/../x").unwrap();
-        assert_eq!(loaded.dsp, dsp.sanitized());
+        assert_eq!(
+            loaded.dsp,
+            DspSettings {
+                eq_bands: crate::peq::normalize_geq_bands(&dsp.eq_bands),
+                ..dsp.sanitized()
+            },
+            "saved EQ is canonicalized to the Graphic EQ"
+        );
         store.delete_profile("My Cans/../x").unwrap();
         assert!(store.load_profile("My Cans/../x").is_err());
         let _ = std::fs::remove_dir_all(store.root());
@@ -621,6 +639,24 @@ mod tests {
 
         std::fs::write(store.root().join("settings.json"), "{not json").unwrap();
         assert_eq!(store.load_settings(), AppSettings::default());
+        let _ = std::fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn load_settings_forces_auto_anti_clip_preamp_and_chunksize() {
+        let store = temp_store("autopreamp");
+        store.ensure_layout().unwrap();
+        let stored = AppSettings {
+            preamp_db: -5.0,
+            auto_preamp: false,
+            chunksize: 2048,
+            ..AppSettings::default()
+        };
+        store.save_settings(&stored).unwrap();
+        let back = store.load_settings();
+        assert_eq!(back.preamp_db, 0.0);
+        assert!(back.auto_preamp);
+        assert_eq!(back.chunksize, DEFAULT_CHUNKSIZE);
         let _ = std::fs::remove_dir_all(store.root());
     }
 
@@ -681,6 +717,6 @@ mod tests {
         let (eq, cf) = compute_curves(&DspSettings::default(), DEFAULT_SAMPLE_RATE);
         assert_eq!(eq.freq_hz.len(), cf.freq_hz.len());
         assert_eq!(eq.composite_db.len(), 256);
-        assert_eq!(eq.per_band_db.len(), 3);
+        assert_eq!(eq.per_band_db.len(), crate::peq::GEQ_BAND_COUNT);
     }
 }
