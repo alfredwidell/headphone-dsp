@@ -27,14 +27,12 @@ use crate::state::{DspSettings, IoConfig};
 const GAIN_CROSSFEED_HALF_DB: f64 = -6.0206;
 const PREAMP_EPSILON_DB: f64 = 1e-3;
 
-fn conv_filter(path: &Path) -> Value {
+fn conv_filter(taps: &[f64]) -> Value {
     json!({
         "type": "Conv",
         "parameters": {
-            "type": "Raw",
-            "filename": path.to_string_lossy(),
-            "format": "TEXT",
-            "skip_bytes_lines": 1
+            "type": "Values",
+            "values": taps
         }
     })
 }
@@ -172,8 +170,8 @@ pub fn build_config(io: &IoConfig, dsp: &DspSettings, runtime_dir: &Path) -> Res
             write_text_fir_file(&side_path, &side)
                 .map_err(|e| format!("writing {}: {e}", side_path.display()))?;
 
-            filters.insert("crossfeed_mid_filter".to_string(), conv_filter(&mid_path));
-            filters.insert("crossfeed_side_filter".to_string(), conv_filter(&side_path));
+            filters.insert("crossfeed_mid_filter".to_string(), conv_filter(&mid));
+            filters.insert("crossfeed_side_filter".to_string(), conv_filter(&side));
 
             // Mid = (L+R)/2, Side = (L-R)/2
             mixers.insert(

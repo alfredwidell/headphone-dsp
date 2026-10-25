@@ -506,6 +506,39 @@ fn set_webview_zoom(zoom: f64, window: tauri::WebviewWindow) -> Result<f64, Stri
     Ok(clamped)
 }
 
+fn compute_crossfeed_preview_sync(
+    angle_deg: f64,
+    mid_boost_db: f64,
+    sample_rate: u32,
+    enabled: bool,
+) -> CrossfeedPreview {
+    let dsp_rate = crate::crossfeed::ku100_base_sample_rate(sample_rate);
+    let mut preview = crate::crossfeed::compute_crossfeed_preview(angle_deg, dsp_rate, mid_boost_db);
+    if !enabled {
+        let zeros = vec![0.0; preview.freq_hz.len()];
+        preview.mid_db = zeros.clone();
+        preview.side_db = zeros.clone();
+        preview.ild_db = zeros;
+    }
+    preview
+}
+
+/// Real KU100 Mid/Side/ILD filter response for the given parameters.
+/// Pure computation: does not lock the engine mutex or touch CamillaDSP.
+#[tauri::command]
+async fn get_crossfeed_preview(
+    angle_deg: f64,
+    mid_boost_db: f64,
+    sample_rate: u32,
+    enabled: bool,
+) -> Result<CrossfeedPreview, String> {
+    tokio::task::spawn_blocking(move || {
+        compute_crossfeed_preview_sync(angle_deg, mid_boost_db, sample_rate, enabled)
+    })
+    .await
+    .map_err(|e| format!("crossfeed preview failed: {e}"))
+}
+
 /// Origin of the only external link the app opens: the AutoEQ headphone search.
 const AUTOEQ_ORIGIN: &str = "https://autoeq.app";
 
@@ -583,6 +616,7 @@ pub fn run() {
             export_autoeq,
             set_webview_zoom,
             open_external_url,
+            get_crossfeed_preview,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Headphone DSP");
@@ -684,6 +718,22 @@ mod tests {
         assert!(is_permitted_external_url("https://autoeq.app/?q=hd650"));
         assert!(!is_permitted_external_url("http://autoeq.app"));
         assert!(!is_permitted_external_url("https://autoeq.app.example/"));
+    }
+
+    #[test]
+    fn get_crossfeed_preview_follows_the_enabled_flag() {
+        let on = compute_crossfeed_preview_sync(35.0, 3.0, 48_000, true);
+        assert_eq!(on.freq_hz.len(), 256);
+        for curve in [&on.mid_db, &on.side_db, &on.ild_db] {
+            assert_eq!(curve.len(), 256);
+            assert!(curve.iter().any(|v| v.abs() > 1e-6), "enabled curve must be non-zero");
+        }
+
+        let off = compute_crossfeed_preview_sync(35.0, 3.0, 48_000, false);
+        assert_eq!(off.freq_hz, on.freq_hz);
+        for curve in [&off.mid_db, &off.side_db, &off.ild_db] {
+            assert!(curve.iter().all(|v| *v == 0.0), "disabled curve must be all zeros");
+        }
     }
 
     #[test]

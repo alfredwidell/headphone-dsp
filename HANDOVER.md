@@ -62,6 +62,7 @@ headphone-dsp/
 - **Stage order:**
   1. `preamp_gain` (`type: Gain`, channels `[0, 1]`) — omitted when `|effective_preamp_db| <= 1e-3` or `master_bypass == true`.
   2. Literal Mid/Side Crossfeed (`crossfeed_to_mid_side` mixer at `-6.0206 dB` → `crossfeed_mid_filter` on ch 0 & `crossfeed_side_filter` on ch 1 → `crossfeed_from_mid_side` mixer) — omitted when `!crossfeed_enabled || master_bypass`.
+     - **Important live hot-reload rule (`conv_filter`):** `crossfeed_mid_filter` and `crossfeed_side_filter` use inline `"type": "Values", "values": taps` (rather than `"type": "Raw", "filename": "..."`) so CamillaDSP's config-diff detects tap changes during `SetConfigJson` and hot-reloads the Mid/Side FIR filters immediately while audio is playing.
   3. 10-Band ISO Graphic EQ (`parametric_eq_band_0..9`, `type: Biquad` `Peaking` at `31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz`, `Q = 1.41`, `±6 dB` range).
      - **Important CamillaDSP 4.1.3 rule:** CamillaDSP rejects a single `Filter` pipeline step if `channels` contains duplicate indices, and we emit a single step `{"type": "Filter", "channels": [0, 1], "names": band_names}` applying all 10 bands to both channels.
      - **AutoEQ Import/Fitting (`src-tauri/src/peq.rs`):** 10-band AutoEQ `FixedBandEQ` presets map 1:1 on the fast path; arbitrary AutoEQ parametric presets (`LS`, `HS`, `PK`) and `GraphicEQ:` curves are fitted onto the 10 ISO bands via 4 rounds of regularized least squares.
@@ -83,14 +84,15 @@ headphone-dsp/
   - Uses Option 1 — Zero-driver WASAPI Loopback: enumerates Windows output endpoints via `cpal` and exposes each as a capture option with `backend: "Wasapi"`, `is_loopback: true` (`loopback: true`, `format: "F32_LE"` in CamillaDSP) alongside standard WASAPI playback endpoints (`exclusive: bool` supported).
 
 ### 3.4 UI & Zoom (`ui/index.html`, `ui/style.css`, `ui/app.js`)
-- **4-Group Top Header Bar (`.topbar`):**
+- **3-Group Top Header Bar (`.topbar`):**
   1. `.brand` (`HEADPHONE DSP` title + subtitle, separated by right border)
-  2. `.routing-pod` (`OUTPUT / DAC` selector + `↻` refresh button)
-  3. `.meter-section` (`● Running <rate>` + stereo `L/R` output meter + `CLIP`)
-  4. `.engine-controls` (`DSP LOAD` + `HW VOL` + `A / B` + `Start/Stop DSP`)
-- **Graphic Equalizer Card (`#eq-card`):**
-  - Header integrates the `PROFILE` selector (`#profiles`, `Save as…`, `⌫`, `AutoEQ ↗` with clickable `autoeq.app` preset search link via `open_external_url`) and `Flat / Reset`.
-  - Compact `±12 dB` SVG frequency-response graph (`viewBox="0 0 800 136"`) above a 10-band studio vertical fader bank (`±6 dB` range, `184px` fader height).
+  2. `.meter-section` (`● Running <rate>` + expanded stereo `L/R` output meter with direct red visual clip indication; click meter to clear)
+  3. `.engine-controls` (`HW VOL` with `#hwvol-dialog` safety confirmation modal before locking to `100% / 0 dB`, `A / B` full-workspace bypass, and `Start/Stop DSP`)
+- **Unified Processor Rack Card (`main.workspace.card`):**
+  - **50% / 50% Top Rack Header (`.rack-header`):** Left half holds `OUTPUT / DAC` (`.routing-pod`); right half holds `PROFILE` (`#profiles`, `Save as…`, `⌫`, `AutoEQ ↗` with clickable `autoeq.app` preset search link via `open_external_url`).
+  - **Left 1/3 Pane (`SPATIAL PROCESSING` / `#crossfeed-card`):** Speaker angle (`0°–90°`), Mid flatness (`0–18 dB`), Virtual Listening Stage diagram, and real-data KU100 Mid/Side/ILD response graph (`get_crossfeed_preview` via `spawn_blocking`, `-24..+12 dB`) with 3 color-coded explanatory rows below.
+  - **Right 2/3 Pane (`FREQUENCY SHAPING` / `#eq-card`):** Composite EQ graph (`0` to `−18 dB`, remaining visible in dimmed grey when EQ is switched off) above a 10-band studio vertical fader bank (`±6 dB` range, `184px` fader height).
+  - **Full-Workspace Bypass Overlay (`#bypass-overlay`):** Covers and dims both Spatial Processing and Frequency Shaping panes when `A / B` bypass is active.
 - **UI Zoom:** Supports **`Ctrl +` / `Ctrl −` / `Ctrl 0`** and **`Ctrl + Mousewheel`** (`70%`–`200%`), persisted in `localStorage` (`headphone-dsp.ui-zoom.v1`) and applied via Tauri's native `WebviewWindow::set_zoom` (`set_webview_zoom` command).
 
 ---

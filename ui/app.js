@@ -71,6 +71,7 @@
   let state = null, settings = clone(defaults), revision = 0, selectedBand = -1;
   let updateTimer, queue = Promise.resolve(), pollTimer, pollBusy = false, pollGeneration = 0;
   let ready = false, drag = null, frame = null, toastError = '', clipAcknowledged = 0;
+  let crossPreview = null, crossRevision = 0, crossBusy = false;
   let mockSettings = clone(defaults), mockRunning = false, mockClips = 0;
   let profileAction = 'save', engineBusy = false, actionDepth = 0;
   const storageKey = 'headphone-dsp.preview.profiles.v1';
@@ -116,9 +117,12 @@
       const coeff = coefficients(band,rate);
       return freq_hz.map(f => band.enabled ? responseAt(coeff,f,rate) : 0);
     });
-    const composite_db = freq_hz.map((_,i) => s.eq_enabled ? per_band_db.reduce((sum,values) => sum+values[i],0) : 0);
-    const raw_peak_db = Math.max(0,...composite_db);
-    const effective_preamp_db = s.master_bypass ? 0 : s.preamp_db - (s.auto_preamp ? Math.max(0,raw_peak_db) : 0);
+    const raw_db = freq_hz.map((_,i) => per_band_db.reduce((sum,values) => sum+values[i],0));
+    const curve_peak_db = Math.max(0,...raw_db);
+    const curve_preamp_db = s.preamp_db - (s.auto_preamp ? Math.max(0,curve_peak_db) : 0);
+    const composite_db = raw_db.map(v => v + curve_preamp_db);
+    const raw_peak_db = s.eq_enabled ? curve_peak_db : 0;
+    const effective_preamp_db = (s.master_bypass || !s.eq_enabled) ? 0 : curve_preamp_db;
     return {freq_hz,per_band_db,composite_db,raw_peak_db,effective_preamp_db};
   }
   function fitGeq(target,rate) {
@@ -151,7 +155,7 @@
       const boost = s.crossfeed_mid_boost_db*(1-Math.exp(-f/600))*Math.exp(-f/14000);
       mid_db.push(s.crossfeed_enabled ? 20*Math.log10(mid)+boost : 0);
       side_db.push(s.crossfeed_enabled ? 20*Math.log10(side) : 0);
-      ild_db.push(s.crossfeed_enabled ? Math.min(24,-20*Math.log10(Math.max(.001,cross))) : 0);
+      ild_db.push(s.crossfeed_enabled ? -Math.min(24,-20*Math.log10(Math.max(.001,cross))) : 0);
     });
     return {freq_hz,mid_db,side_db,ild_db};
   }
@@ -210,6 +214,7 @@
   }
   async function mockInvoke(command,args={}) {
     switch(command) {
+      case 'get_crossfeed_preview': return computeCrossfeed({crossfeed_angle_deg:args.angleDeg,crossfeed_mid_boost_db:args.midBoostDb,crossfeed_enabled:args.enabled});
       case 'get_live_meters': return mockMeters();
       case 'update_dsp_settings': mockSettings=automaticPreamp(args.settings); break;
       case 'start_engine': mockSettings=automaticPreamp(args.settings); mockRunning=true; break;
@@ -237,7 +242,6 @@
   }
   function report(error) {
     const message=typeof error==='string'?error:error?.message||String(error);
-    $('sync-status').textContent='Not synced · edit a setting to retry';
     if(message!==toastError) { toast(message,'error'); toastError=message; setTimeout(()=>{toastError='';},5000); }
   }
   function fillRange(el) { el.style.setProperty('--fill',`${100*(Number(el.value)-Number(el.min))/(Number(el.max)-Number(el.min))}%`); }
@@ -282,10 +286,10 @@
     $('bypass').setAttribute('aria-pressed',String(settings.master_bypass)); $('bypass-label').textContent=settings.master_bypass?'Original signal':'DSP active';
     $('hw-vol').setAttribute('aria-pressed',String(!!settings.hw_volume_bypass)); $('hw-vol-label').textContent=settings.hw_volume_bypass?'Fixed 0 dB':'OS Vol';
     $('bypass-overlay').hidden=!settings.master_bypass;
+    document.querySelector('main.workspace').classList.toggle('is-bypassed',!!settings.master_bypass);
     $('crossfeed-card').classList.toggle('processing-off',!settings.crossfeed_enabled);
+    $('eq-card').classList.toggle('processing-off',!settings.eq_enabled);
     $('exclusive-wrap').hidden=!(settings.capture_backend.toLowerCase()==='wasapi'||settings.playback_backend.toLowerCase()==='wasapi');
-    const dspRate = dspSampleRate(settings.sample_rate);
-    $('latency').textContent=`${formatRate(settings.sample_rate)} · ${settings.chunksize} samples · ${(settings.chunksize/dspRate*1000).toFixed(1)} ms buffer`;
     document.querySelectorAll('[data-angle]').forEach(el=>el.classList.toggle('active',Number(el.dataset.angle)===settings.crossfeed_angle_deg));
   }
   function renderBands() {
@@ -304,46 +308,69 @@
     const fill=fader.querySelector('.geq-fill');fill.style.top=`${Math.min(50,position)}%`;fill.style.height=`${Math.abs(position-50)}%`;
     row.classList.toggle('selected',selectedBand===index);
   }
-  const graph={width:800,height:136,left:52,right:778,top:14,bottom:110};
+  const graph={width:800,height:136,left:52,right:778,top:15,bottom:111};
   const gx=f=>graph.left+Math.log10(clamp(f,20,20000)/20)/3*(graph.right-graph.left);
-  const gy=db=>graph.top+(12-clamp(db,-14,14))/24*(graph.bottom-graph.top);
+  const gy=db=>graph.top+(0-clamp(db,-18,0))/18*(graph.bottom-graph.top);
   function pathFor(freq,values,x=gx,y=gy) { return freq.map((f,i)=>`${i?'L':'M'}${x(f).toFixed(2)},${y(Number.isFinite(values[i])?values[i]:0).toFixed(2)}`).join(' '); }
   function renderEQ(preview) {
     if(!preview?.freq_hz?.length) return;
-    const ticks=[20,50,100,200,500,1000,2000,5000,10000,20000], levels=[-12,-6,0,6,12];
-    let html='<defs><linearGradient id="eq-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#b98af0" stop-opacity=".2"/><stop offset="100%" stop-color="#b98af0" stop-opacity=".015"/></linearGradient><clipPath id="plot-clip"><rect x="52" y="14" width="726" height="96"/></clipPath></defs>';
+    const ticks=[20,50,100,200,500,1000,2000,5000,10000,20000], levels=[-18,-12,-6,0];
+    let html='<defs><linearGradient id="eq-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#b98af0" stop-opacity=".2"/><stop offset="100%" stop-color="#b98af0" stop-opacity=".015"/></linearGradient><clipPath id="plot-clip"><rect x="52" y="10" width="726" height="106"/></clipPath></defs>';
     levels.forEach(db=>{const y=gy(db);html+=`<line x1="52" x2="778" y1="${y}" y2="${y}" stroke="${db===0?'#83899775':'#ffffff09'}" ${db===0?'stroke-dasharray="3 5"':''}/><text x="42" y="${y+3.5}" text-anchor="end" fill="#838997" font-size="11">${db>0?'+':''}${db}</text>`;});
-    ticks.forEach(f=>{const x=gx(f);html+=`<line x1="${x}" x2="${x}" y1="14" y2="110" stroke="#ffffff08"/><text x="${x}" y="128" text-anchor="middle" fill="#838997" font-size="11">${f>=1000?`${f/1000}k`:f}</text>`;});
-    html+='<text x="6" y="65.5" fill="#838997" font-size="10">dB</text><g clip-path="url(#plot-clip)">';
+    ticks.forEach(f=>{const x=gx(f);html+=`<line x1="${x}" x2="${x}" y1="15" y2="111" stroke="#ffffff08"/><text x="${x}" y="128" text-anchor="middle" fill="#838997" font-size="11">${f>=1000?`${f/1000}k`:f}</text>`;});
+    html+='<text x="6" y="66.5" fill="#838997" font-size="10">dB</text><g clip-path="url(#plot-clip)">';
     const compositePath=pathFor(preview.freq_hz,preview.composite_db);
-    html+=`<path d="${compositePath} L${gx(20000)},${gy(0)} L${gx(20)},${gy(0)} Z" fill="url(#eq-fill)"/>`;
-    (preview.per_band_db||[]).forEach((values,i)=>{if(settings.eq_bands[i]?.enabled && settings.eq_enabled) html+=`<path d="${pathFor(preview.freq_hz,values)}" fill="none" stroke="${colors[i]}" stroke-width="1.15" opacity="${selectedBand===i?.7:.3}"/>`;});
-    html+=`<path d="${compositePath}" fill="none" stroke="#b98af0" stroke-width="2.5" stroke-linejoin="round" opacity="${settings.eq_enabled?1:.3}"/></g>`;
-    settings.eq_bands.forEach((b,i)=>{
-      if(!b.enabled) return;
-      const y=gy(gainTypes.has(b.band_type)?b.gain_db:0),x=gx(b.freq_hz);
-      html+=`<g class="handle" data-handle="${i}" opacity="${settings.eq_enabled?1:.4}"><circle cx="${x}" cy="${y}" r="19" fill="transparent"/>${selectedBand===i?`<circle cx="${x}" cy="${y}" r="14" fill="${colors[i]}" opacity=".12"/>`:''}<circle cx="${x}" cy="${y}" r="9" fill="#171b22" stroke="${colors[i]}" stroke-width="1.5"/><text x="${x}" y="${y+3}" text-anchor="middle" fill="${colors[i]}" font-size="11" pointer-events="none">${i+1}</text></g>`;
-    });
+    html+=`<path d="${compositePath} L${gx(20000)},${gy(-18)} L${gx(20)},${gy(-18)} Z" fill="url(#eq-fill)" opacity="${settings.eq_enabled?1:.25}"/>`;
+    html+=`<path d="${compositePath}" fill="none" stroke="${settings.eq_enabled?'#b98af0':'#838997'}" stroke-width="2.5" stroke-linejoin="round" opacity="${settings.eq_enabled?1:.5}"/></g>`;
     $('eq-graph').innerHTML=html;
     $('peak').textContent=`${signed(preview.raw_peak_db||0)} dB`;
     $('effective').textContent=`${signed(preview.effective_preamp_db||0)} dB`;
     $('effective').style.color=preview.effective_preamp_db+(preview.raw_peak_db||0)>0?'var(--warn)':'var(--ok)';
   }
   function renderStage() {
-    const a=settings.crossfeed_angle_deg*Math.PI/180,cx=150,cy=111,r=91;
+    const a=settings.crossfeed_angle_deg*Math.PI/180,cx=150,cy=108,r=88;
     const lx=cx-Math.sin(a)*r,rx=cx+Math.sin(a)*r,y=cy-Math.cos(a)*r;
-    $('stage').innerHTML=`<defs><radialGradient id="stage-glow"><stop stop-color="#b98af0" stop-opacity=".09"/><stop offset="1" stop-color="#b98af0" stop-opacity="0"/></radialGradient></defs><ellipse cx="150" cy="92" rx="100" ry="66" fill="url(#stage-glow)"/><path d="M59 111 A91 91 0 0 1 241 111" fill="none" stroke="#ffffff12" stroke-dasharray="3 5"/><path d="M${lx} ${y} A91 91 0 ${settings.crossfeed_angle_deg>90?1:0} 1 ${rx} ${y}" stroke="#b98af044" stroke-width="2" fill="none"/><path d="M150 111 L${lx} ${y} M150 111 L${rx} ${y}" stroke="#b98af055" stroke-dasharray="3 4"/><path d="M150 111 V13" stroke="#ffffff14" stroke-dasharray="2 4"/><g fill="#201b2a" stroke="#b98af0"><rect x="${lx-9}" y="${y-12}" width="18" height="24" rx="4"/><rect x="${rx-9}" y="${y-12}" width="18" height="24" rx="4"/></g><g fill="none" stroke="#b98af0" opacity=".7"><circle cx="${lx}" cy="${y+3}" r="4"/><circle cx="${rx}" cy="${y+3}" r="4"/></g><text x="${lx}" y="${y-18}" fill="#b9bfc9" text-anchor="middle" font-size="11">L</text><text x="${rx}" y="${y-18}" fill="#b9bfc9" text-anchor="middle" font-size="11">R</text><circle cx="150" cy="111" r="13" fill="#24212d" stroke="#b98af0" stroke-width="1.5"/><path d="M146 101 L150 96 L154 101 M135 108 V116 M165 108 V116" fill="none" stroke="#b98af0" stroke-width="2"/><text x="150" y="73" text-anchor="middle" fill="#b98af0" font-size="12">±${settings.crossfeed_angle_deg}°</text>`;
+    const labelY=Math.max(12,y-16);
+    const labelLx=Math.min(lx,cx-14),labelRx=Math.max(rx,cx+14);
+    $('stage').innerHTML=`<defs><radialGradient id="stage-glow"><stop stop-color="#b98af0" stop-opacity=".09"/><stop offset="1" stop-color="#b98af0" stop-opacity="0"/></radialGradient></defs><ellipse cx="150" cy="89" rx="100" ry="66" fill="url(#stage-glow)"/><path d="M62 108 A88 88 0 0 1 238 108" fill="none" stroke="#ffffff12" stroke-dasharray="3 5"/><path d="M${lx} ${y} A88 88 0 ${settings.crossfeed_angle_deg>90?1:0} 1 ${rx} ${y}" stroke="#b98af044" stroke-width="2" fill="none"/><path d="M150 108 L${lx} ${y} M150 108 L${rx} ${y}" stroke="#b98af055" stroke-dasharray="3 4"/><path d="M150 108 V14" stroke="#ffffff14" stroke-dasharray="2 4"/><g fill="#201b2a" stroke="#b98af0"><rect x="${lx-9}" y="${y-12}" width="18" height="24" rx="4"/><rect x="${rx-9}" y="${y-12}" width="18" height="24" rx="4"/></g><g fill="none" stroke="#b98af0" opacity=".7"><circle cx="${lx}" cy="${y+3}" r="4"/><circle cx="${rx}" cy="${y+3}" r="4"/></g><text x="${labelLx}" y="${labelY}" fill="#b9bfc9" text-anchor="middle" font-size="11">L</text><text x="${labelRx}" y="${labelY}" fill="#b9bfc9" text-anchor="middle" font-size="11">R</text><circle cx="150" cy="108" r="13" fill="#24212d" stroke="#b98af0" stroke-width="1.5"/><path d="M146 98 L150 93 L154 98 M135 105 V113 M165 105 V113" fill="none" stroke="#b98af0" stroke-width="2"/><text x="150" y="70" text-anchor="middle" fill="#b98af0" font-size="12">±${settings.crossfeed_angle_deg}°</text>`;
   }
   function renderCross(preview) {
     if(!preview?.freq_hz?.length) return;
-    const x=f=>25+Math.log10(f/20)/3*300, y=db=>clamp(70-db*2.2,4,84);
+    const x=f=>22+Math.log10(f/20)/3*310, y=db=>clamp(32-db*2.0,6,84);
     let html='';
-    [-12,0,12,24].forEach(db=>html+=`<line x1="25" x2="325" y1="${y(db)}" y2="${y(db)}" stroke="#ffffff0c"/><text x="19" y="${y(db)+3}" text-anchor="end" font-size="11" fill="#838997">${db}</text>`);
-    [[preview.mid_db,'#b98af0'],[preview.side_db,'#7dd3c8'],[preview.ild_db,'#e8b34b']].forEach(([values,color])=>html+=`<path d="${pathFor(preview.freq_hz,values,x,y)}" fill="none" stroke="${color}" stroke-width="1.5"/>`);
-    [20,1000,20000].forEach(f=>html+=`<text x="${x(f)}" y="98" text-anchor="middle" fill="#838997" font-size="11">${f>=1000?f/1000+'k':f}</text>`);
+    [-24,-12,0,12].forEach(db=>html+=`<line x1="22" x2="332" y1="${y(db)}" y2="${y(db)}" stroke="#ffffff0c"/><text x="17" y="${y(db)+2}" text-anchor="end" font-size="6" fill="#838997">${db}</text>`);
+    [[preview.mid_db,'#b98af0'],[preview.side_db,'#7dd3c8'],[preview.ild_db,'#e8b34b']].forEach(([values,color])=>html+=`<path d="${pathFor(preview.freq_hz,values,x,y)}" fill="none" stroke="${color}" stroke-width="1.25"/>`);
+    [20,1000,20000].forEach(f=>html+=`<text x="${x(f)}" y="95" text-anchor="${f===20?'start':f===20000?'end':'middle'}" fill="#838997" font-size="6">${f>=1000?f/1000+'k':f}</text>`);
     $('cross-chart').innerHTML=html;
   }
-  function drawLocal() { renderEQ(computePEQ(settings)); renderStage(); renderCross(computeCrossfeed(settings)); }
+  function requestCrossfeedPreview() {
+    if(previewMode) {
+      crossPreview=computeCrossfeed(settings);
+      renderCross(crossPreview);
+      return;
+    }
+    ++crossRevision;
+    if(crossBusy) return;
+    crossBusy=true;
+    (async()=>{
+      try {
+        while(true) {
+          const rev=crossRevision;
+          try {
+            const preview=await invoke('get_crossfeed_preview',{
+              angleDeg:settings.crossfeed_angle_deg,
+              midBoostDb:settings.crossfeed_mid_boost_db,
+              sampleRate:settings.sample_rate,
+              enabled:settings.crossfeed_enabled
+            });
+            if(rev===crossRevision) { crossPreview=preview; renderCross(preview); }
+          } catch { /* Ignore transient preview errors; retain the last real curve. */ }
+          if(rev===crossRevision) break;
+        }
+      } finally { crossBusy=false; }
+    })();
+  }
+  function drawLocal() { renderEQ(computePEQ(settings)); renderStage(); if(previewMode) renderCross(computeCrossfeed(settings)); else if(crossPreview) renderCross(crossPreview); }
   function requestDraw() { if(!frame) frame=requestAnimationFrame(()=>{frame=null;drawLocal();}); }
   function renderMeters(meters) {
     if(!meters) return;
@@ -352,21 +379,23 @@
       (meters.sample_rate !== settings.sample_rate || (Number.isFinite(meters.chunksize) && meters.chunksize > 0 && meters.chunksize !== settings.chunksize))) {
       settings.sample_rate=meters.sample_rate;
       if(Number.isFinite(meters.chunksize) && meters.chunksize > 0) settings.chunksize=meters.chunksize;
-      updateLabels(); requestDraw();
+      updateLabels(); requestDraw(); requestCrossfeedPreview();
     }
     const peaks=meters.playback_peak||[-120,-120], rms=meters.playback_rms||peaks;
+    const clips=Number(meters.clipped_samples||0); if(clips<clipAcknowledged) clipAcknowledged=0;
+    const hasClip=(clips>clipAcknowledged)||(meters.running && peaks.some(p=>p>=-.1));
+    const clipInfo='Clipping detected · click meter to clear indicator';
+    $('output-meters').classList.toggle('is-clipped',hasClip);
+    $('output-meters').title=hasClip?clipInfo:'Output level · click to clear clipping indicator';
     $('output-meters').querySelectorAll('.stereo i').forEach((bar,i)=>{
       const db=meters.running ? (peaks[i]??-120) : -120;
       bar.querySelector('b').style.width=`${clamp((db+60)/60*100,0,100)}%`;
       bar.querySelector('em').style.left=`${clamp(((meters.running?rms[i]:-120)+60)/60*100,0,100)}%`;
-      bar.title=`${i?'R':'L'} peak ${db.toFixed(1)} dBFS · RMS ${(rms[i]??-120).toFixed(1)} dBFS`;
+      bar.classList.toggle('is-clipped',hasClip || (meters.running && (peaks[i]??-120)>=-.1));
+      bar.title=`${i?'R':'L'} peak ${db.toFixed(1)} dBFS · RMS ${(rms[i]??-120).toFixed(1)} dBFS${hasClip?` · ${clipInfo}`:''}`;
     });
     const max=meters.running?Math.max(...peaks):-120;
-    $('output-meters').setAttribute('aria-label',`Output peak ${max<=-100?'silent':max.toFixed(1)+' dBFS'}`);
-    $('cpu').textContent=`${Number(meters.load_percent||0).toFixed(1)}%`;
-    const clips=Number(meters.clipped_samples||0); if(clips<clipAcknowledged) clipAcknowledged=0;
-    $('clip').classList.toggle('is-clipped',clips>clipAcknowledged); $('clip').querySelector('span').textContent=clips.toLocaleString();
-    $('clip').title=`${clips} clipped samples. Click to acknowledge the warning.`;
+    $('output-meters').setAttribute('aria-label',`Output peak ${max<=-100?'silent':max.toFixed(1)+' dBFS'}${hasClip?' · Clipping detected':''}; activate to clear clipping indicator`);
     $('engine-status').textContent=meters.error?'● Engine error':meters.running?`● Running ${formatRate(settings.sample_rate)}`:`● ${meters.state||'Stopped'}`;
     $('engine-status').className=`status ${meters.error?'error':meters.running?'running':''}`;
     $('engine').innerHTML=meters.running?'Stop DSP <span>■</span>':'Start DSP <span>▶</span>';
@@ -393,15 +422,18 @@
     state=response; settings=automaticPreamp(response.settings);
     if(full) renderSettings(); else { updateLabels(); syncAllBandRows(); }
     const automatic=response.settings.auto_preamp===true && response.settings.preamp_db===0 && JSON.stringify(response.settings.eq_bands)===JSON.stringify(settings.eq_bands);
-    renderEQ((automatic && response.peq_preview)||computePEQ(settings)); renderStage(); renderCross(response.crossfeed_preview||computeCrossfeed(settings));
+    renderEQ((settings.eq_enabled && automatic && response.peq_preview)||computePEQ(settings)); renderStage();
+    // Invalidate any preview request made before this authoritative response.
+    ++crossRevision;
+    if(response.crossfeed_preview) { crossPreview=response.crossfeed_preview; renderCross(crossPreview); }
+    else requestCrossfeedPreview();
     renderMeters(response.meters);
-    $('sync-status').textContent=previewMode?'Preview · changes simulated locally':'All changes applied';
   }
   function syncAllBandRows() { settings.eq_bands.forEach((_,i)=>syncBandRow(i)); }
   function edited({bands=false}={}) {
     if(!ready) return;
     revision++; $('dirty').hidden=false; updateLabels(); if(bands) renderBands();
-    requestDraw(); $('sync-status').textContent=previewMode?'Updating preview…':'Applying changes…';
+    requestDraw();
     // Coalesce the next 80 ms of edits without starving live audio during a
     // continuous drag. The last edit always gets its own trailing update.
     if(!updateTimer) updateTimer=setTimeout(sendUpdate,80);
@@ -436,12 +468,24 @@
 
   // Global controls: local feedback first, ordered/debounced audio updates second.
   [['angle','crossfeed_angle_deg'],['mid','crossfeed_mid_boost_db']].forEach(([id,key])=>{
-    $(id).addEventListener('input',event=>{settings[key]=Number(event.target.value);fillRange(event.target);edited();});
+    $(id).addEventListener('input',event=>{settings[key]=Number(event.target.value);fillRange(event.target);edited();requestCrossfeedPreview();});
   });
-  [['crossfeed-enabled','crossfeed_enabled'],['eq-enabled','eq_enabled'],['exclusive','exclusive_mode']].forEach(([id,key])=>$(id).addEventListener('change',event=>{settings[key]=event.target.checked;edited();}));
+  [['crossfeed-enabled','crossfeed_enabled'],['eq-enabled','eq_enabled'],['exclusive','exclusive_mode']].forEach(([id,key])=>$(id).addEventListener('change',event=>{settings[key]=event.target.checked;edited();if(key==='crossfeed_enabled') requestCrossfeedPreview();}));
   $('bypass').addEventListener('click',()=>{settings.master_bypass=!settings.master_bypass;edited();});
-  $('hw-vol').addEventListener('click',()=>{settings.hw_volume_bypass=!settings.hw_volume_bypass;edited();toast(settings.hw_volume_bypass?'Hardware volume mode: OS volume locked to 100% (0 dB).':'OS software volume control restored.');});
-  $('angle-presets').addEventListener('click',event=>{const button=event.target.closest('[data-angle]');if(button){settings.crossfeed_angle_deg=Number(button.dataset.angle);setRange('angle',settings.crossfeed_angle_deg);edited();}});
+  $('hw-vol').addEventListener('click',()=>{
+    if(!ready) return;
+    if(!settings.hw_volume_bypass) { $('hw-vol').blur(); $('hwvol-dialog').showModal(); return; }
+    settings.hw_volume_bypass=false;edited();toast('OS software volume control restored.');
+  });
+  $('hwvol-dialog').addEventListener('close',()=>$('hw-vol').blur());
+  document.querySelectorAll('.ab-button').forEach(button=>button.addEventListener('click',()=>button.blur()));
+  $('hwvol-confirm').addEventListener('click',()=>{
+    $('hwvol-dialog').close();
+    $('hw-vol').blur();
+    if(!ready) return;
+    settings.hw_volume_bypass=true;edited();toast('Hardware volume mode: OS volume locked to 100% (0 dB).');
+  });
+  $('angle-presets').addEventListener('click',event=>{const button=event.target.closest('[data-angle]');if(button){settings.crossfeed_angle_deg=Number(button.dataset.angle);setRange('angle',settings.crossfeed_angle_deg);edited();requestCrossfeedPreview();}});
   ['capture','playback'].forEach(direction=>$(direction).addEventListener('change',event=>{
     const device=(state[`${direction}_devices`]||[]).find(d=>d.id===event.target.value); if(!device) return;
     settings[`${direction}_device`]=device.id; settings[`${direction}_backend`]=device.backend;
@@ -458,7 +502,19 @@
     catch(error) { report(error); }
     finally {engineBusy=false; $('engine').disabled=!ready;}
   });
-  $('clip').addEventListener('click',()=>{clipAcknowledged=state?.meters?.clipped_samples||0; $('clip').classList.remove('is-clipped');});
+  $('output-meters').addEventListener('click',()=>{
+    clipAcknowledged=state?.meters?.clipped_samples||0;
+    $('output-meters').classList.remove('is-clipped');
+    $('output-meters').title='Output level · click to clear clipping indicator';
+    $('output-meters').setAttribute('aria-label','Output level; activate to clear clipping indicator');
+    $('output-meters').querySelectorAll('.stereo i').forEach(bar=>{
+      bar.classList.remove('is-clipped');
+      bar.title=bar.title.split(' · Clipping detected')[0];
+    });
+  });
+  $('output-meters').addEventListener('keydown',event=>{
+    if(event.key==='Enter' || event.key===' ') {event.preventDefault();$('output-meters').click();}
+  });
   $('reset').addEventListener('click',()=>{
     settings.eq_bands=makeGeqBands();
     edited({bands:true});toast('Graphic EQ flattened to 0.0 dB.');
@@ -609,7 +665,6 @@
     setUIZoom(savedZoom, false);
     $('preview-badge').hidden=!previewMode;
     if(previewMode) {
-      $('footer-mode').textContent='BROWSER PREVIEW · SIMULATED METERS · NO AUDIO';
       $('cross-chart').setAttribute('aria-label','Approximate browser crossfeed response; not measured KU100 HRTF data');
       $('cross-chart').parentElement.title='Browser preview uses an analytical crossfeed approximation. Native mode displays the backend KU100 response.';
     }
@@ -618,7 +673,7 @@
       applyResponse(state,revision,true);$('app').setAttribute('aria-busy','false');$('engine').disabled=false;
     } catch(error) {
       $('app').setAttribute('aria-busy','false');$('engine-status').textContent='● Connection failed';$('engine-status').className='status error';
-      report(error);$('sync-status').textContent='Audio engine unavailable. Restart the app to reconnect.';
+      report(error);
       document.querySelectorAll('button,input,select').forEach(el=>el.disabled=true);
       // A native bridge failure must never silently look like a working mock engine.
     }
