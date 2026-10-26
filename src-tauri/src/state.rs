@@ -472,12 +472,13 @@ pub fn builtin_profiles() -> Vec<Profile> {
 /// no preamp, and disabled crossfeed reports zeros.
 pub fn compute_curves(dsp: &DspSettings, sample_rate: u32) -> (PeqResponse, CrossfeedPreview) {
     let dsp_rate = crate::crossfeed::ku100_base_sample_rate(sample_rate);
-    let (preamp, auto) = if dsp.master_bypass {
-        (0.0, false)
-    } else {
-        (dsp.preamp_db, dsp.auto_preamp)
-    };
-    let eq = compute_peq_response(&dsp.eq_bands, preamp, auto, dsp_rate, dsp.eq_enabled);
+    let eq = compute_peq_response(
+        &dsp.eq_bands,
+        dsp.preamp_db,
+        dsp.auto_preamp,
+        dsp_rate,
+        dsp.eq_enabled,
+    );
 
     let mut crossfeed = compute_crossfeed_preview(
         dsp.crossfeed_angle_deg,
@@ -699,16 +700,17 @@ mod tests {
     }
 
     #[test]
-    fn master_bypass_curve_has_no_preamp_and_disabled_crossfeed_is_zero() {
+    fn master_bypass_curve_keeps_level_matching_preamp_and_disabled_crossfeed_is_zero() {
         let dsp = DspSettings {
             preamp_db: -6.0,
+            auto_preamp: false,
             master_bypass: true,
             crossfeed_enabled: false,
             eq_bands: Vec::new(),
             ..DspSettings::default()
         };
         let (eq, cf) = compute_curves(&dsp, 48_000);
-        assert_eq!(eq.effective_preamp_db, 0.0);
+        assert_eq!(eq.effective_preamp_db, -6.0);
         assert!(cf.mid_db.iter().all(|v| *v == 0.0));
     }
 

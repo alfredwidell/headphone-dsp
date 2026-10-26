@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub const LINUX_VIRTUAL_SINK_NAME: &str = "headphone_dsp_sink";
 pub const LINUX_VIRTUAL_SINK_MONITOR: &str = "headphone_dsp_sink.monitor";
-const LINUX_VIRTUAL_SINK_DESCRIPTION: &str = "Headphone_DSP_Virtual_Input";
-const VIRTUAL_SINK_LABEL: &str = "[Virtual Sink Loopback] Headphone DSP Virtual Input";
+const LINUX_VIRTUAL_SINK_DESCRIPTION: &str = "HeadphoneDSP";
+const VIRTUAL_SINK_LABEL: &str = "[Virtual Sink Loopback] HeadphoneDSP";
 
 pub const BACKEND_PULSE: &str = "Pulse";
 pub const BACKEND_ALSA: &str = "Alsa";
@@ -337,18 +337,41 @@ pub fn maximize_linux_output_gains(playback_backend: &str, playback_device: &str
 pub fn ensure_linux_virtual_sink() -> Result<String, String> {
     maximize_linux_output_gains("", "");
 
+    let default_sink = run_lines("pactl", &["get-default-sink"])
+        .ok()
+        .and_then(|lines| lines.into_iter().next())
+        .map(|s| s.trim().to_string());
+    let was_default = default_sink.as_deref() == Some(LINUX_VIRTUAL_SINK_NAME);
+
+    let expected_prop = format!("device.description={LINUX_VIRTUAL_SINK_DESCRIPTION}");
+    if let Ok(modules) = run_lines("pactl", &["list", "short", "modules"]) {
+        for line in &modules {
+            if line.contains("module-null-sink")
+                && line.contains(LINUX_VIRTUAL_SINK_NAME)
+                && !line.contains(&expected_prop)
+            {
+                if let Some(id) = line.split('\t').next().map(str::trim).filter(|s| !s.is_empty()) {
+                    let _ = run_lines("pactl", &["unload-module", id]);
+                }
+            }
+        }
+    }
+
     let sinks = run_lines("pactl", &["list", "short", "sinks"])?;
     let exists = sinks
         .iter()
         .any(|line| pactl_short_name(line) == Some(LINUX_VIRTUAL_SINK_NAME));
     if !exists {
         let sink_name_arg = format!("sink_name={LINUX_VIRTUAL_SINK_NAME}");
-        let sink_properties_arg = format!("sink_properties=device.description={LINUX_VIRTUAL_SINK_DESCRIPTION}");
+        let sink_properties_arg = format!("sink_properties={expected_prop}");
         run_lines(
             "pactl",
             &["load-module", "module-null-sink", &sink_name_arg, &sink_properties_arg],
         )?;
         let _ = run_lines("pactl", &["set-sink-mute", LINUX_VIRTUAL_SINK_NAME, "0"]);
+        if was_default {
+            let _ = run_lines("pactl", &["set-default-sink", LINUX_VIRTUAL_SINK_NAME]);
+        }
     }
     Ok(LINUX_VIRTUAL_SINK_MONITOR.to_string())
 }

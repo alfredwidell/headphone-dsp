@@ -109,8 +109,9 @@ fn playback_device(io: &IoConfig) -> Result<Value, String> {
 /// valid YAML). Writes crossfeed FIR files under `runtime_dir/generated_fir`.
 ///
 /// Pipeline order: preamp -> Mid/Side crossfeed -> parametric EQ. With
-/// `master_bypass` set the pipeline is empty (a clean passthrough) and no
-/// FIR files are regenerated.
+/// `master_bypass` set, `preamp_gain` is still applied so A/B comparisons
+/// stay level-matched against the processed chain, while crossfeed and EQ
+/// stages are omitted.
 pub fn build_config(io: &IoConfig, dsp: &DspSettings, runtime_dir: &Path) -> Result<Value, String> {
     if io.sample_rate == 0 {
         return Err("sample rate must be positive".to_string());
@@ -125,43 +126,55 @@ pub fn build_config(io: &IoConfig, dsp: &DspSettings, runtime_dir: &Path) -> Res
     let mut mixers = Map::new();
     let mut pipeline: Vec<Value> = Vec::new();
 
-    if !dsp.master_bypass {
-        // With EQ switched off the bands are left out of the pipeline entirely.
-        let enabled_bands: Vec<EqBand> = if dsp.eq_enabled {
-            dsp.eq_bands
-                .iter()
-                .filter(|b| b.enabled)
-                .map(|b| b.sanitized())
-                .collect()
+    // With EQ switched off the bands are left out of the pipeline entirely.
+    let enabled_bands: Vec<EqBand> = if dsp.eq_enabled {
+        dsp.eq_bands
+            .iter()
+            .filter(|b| b.enabled)
+            .map(|b| b.sanitized())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let crossfeed_taps = if dsp.crossfeed_enabled {
+        let angle = coerce_crossfeed_angle_deg(dsp.crossfeed_angle_deg);
+        let boost = coerce_crossfeed_mid_boost_db(dsp.crossfeed_mid_boost_db);
+        let mid = build_ms_mid_filter_taps(angle, fs, MS_FILTER_TAP_COUNT, boost);
+        let side = build_ms_side_filter_taps(angle, fs, MS_FILTER_TAP_COUNT, boost);
+        Some((mid, side))
+    } else {
+        None
+    };
+
+    let auto_headroom_db = if dsp.auto_preamp {
+        if let Some((ref mid, ref side)) = crossfeed_taps {
+            crate::crossfeed::composite_chain_headroom_db(
+                Some((mid.as_slice(), side.as_slice())),
+                &enabled_bands,
+                fs,
+            )
         } else {
-            Vec::new()
-        };
-
-        let effective_preamp = compute_peq_response(
-            &enabled_bands,
-            dsp.preamp_db,
-            dsp.auto_preamp,
-            fs,
-            dsp.eq_enabled,
-        )
-        .effective_preamp_db;
-        if effective_preamp.abs() > PREAMP_EPSILON_DB {
-            filters.insert(
-                "preamp_gain".to_string(),
-                json!({
-                    "type": "Gain",
-                    "parameters": {"gain": effective_preamp, "inverted": false, "mute": false}
-                }),
-            );
-            pipeline.push(json!({"bypassed": false, "type": "Filter", "channels": [0, 1], "names": ["preamp_gain"]}));
+            compute_peq_response(&enabled_bands, 0.0, true, fs, dsp.eq_enabled)
+                .effective_preamp_db
         }
+    } else {
+        0.0
+    };
+    let effective_preamp = auto_headroom_db + dsp.preamp_db;
+    if effective_preamp.abs() > PREAMP_EPSILON_DB {
+        filters.insert(
+            "preamp_gain".to_string(),
+            json!({
+                "type": "Gain",
+                "parameters": {"gain": effective_preamp, "inverted": false, "mute": false}
+            }),
+        );
+        pipeline.push(json!({"bypassed": false, "type": "Filter", "channels": [0, 1], "names": ["preamp_gain"]}));
+    }
 
-        if dsp.crossfeed_enabled {
-            let angle = coerce_crossfeed_angle_deg(dsp.crossfeed_angle_deg);
-            let boost = coerce_crossfeed_mid_boost_db(dsp.crossfeed_mid_boost_db);
-            let mid = build_ms_mid_filter_taps(angle, fs, MS_FILTER_TAP_COUNT, boost);
-            let side = build_ms_side_filter_taps(angle, fs, MS_FILTER_TAP_COUNT, boost);
-
+    if !dsp.master_bypass {
+        if let Some((mid, side)) = crossfeed_taps {
             let fir_dir = runtime_dir.join("generated_fir");
             let mid_path = fir_dir.join("mid_filter.txt");
             let side_path = fir_dir.join("side_filter.txt");
@@ -229,22 +242,39 @@ pub fn build_config(io: &IoConfig, dsp: &DspSettings, runtime_dir: &Path) -> Res
         }
     }
 
+    // Hardware playback (ALSA/WASAPI) runs CamillaDSP's rate controller, which
+    // needs an async resampler on capture to track the independent clocks.
+    // PulseAudio/PipeWire playback is driven by the server, so no adjustment.
+    let playback_backend = canonical_backend(&io.playback.backend).unwrap_or_default();
+    let rate_adjust = playback_backend != BACKEND_PULSE;
+
     let mut devices = json!({
         "samplerate": fs,
         "chunksize": io.chunk_size,
-        "enable_rate_adjust": false,
+        "enable_rate_adjust": rate_adjust,
         "silence_threshold": -160,
-        "silence_timeout": 5,
+        // Never pause playback on digital silence; pause/resume causes DAC XRUNs.
+        "silence_timeout": 0,
         "capture": capture_device(io)?,
         "playback": playback_device(io)?
     });
-    if source_fs != fs {
+    if rate_adjust {
+        if let Some(map) = devices.as_object_mut() {
+            map.insert("target_level".to_string(), json!(io.chunk_size * 2));
+            map.insert("adjust_period".to_string(), json!(3));
+            map.insert("capture_samplerate".to_string(), json!(source_fs));
+            map.insert(
+                "resampler".to_string(),
+                json!({"type": "AsyncSinc", "profile": "Accurate"}),
+            );
+        }
+    } else if source_fs != fs {
         // Integer ratios use CamillaDSP's synchronous resampler; anything
         // else (including upsampling from below the base rate) is asynchronous.
         let resampler = if source_fs > fs && source_fs % fs == 0 {
             json!({"type": "Synchronous"})
         } else {
-            json!({"type": "AsyncSinc", "profile": "Balanced"})
+            json!({"type": "AsyncSinc", "profile": "Accurate"})
         };
         if let Some(map) = devices.as_object_mut() {
             map.insert("capture_samplerate".to_string(), json!(source_fs));
@@ -372,7 +402,14 @@ pub struct CamillaEngine {
     log_path: PathBuf,
 }
 
+pub const DEFAULT_CAMILLA_WS_PORT: u16 = 1234;
+
 async fn free_local_port() -> Result<u16, String> {
+    if let Ok(listener) = TcpListener::bind(("127.0.0.1", DEFAULT_CAMILLA_WS_PORT)).await {
+        if let Ok(addr) = listener.local_addr() {
+            return Ok(addr.port());
+        }
+    }
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("binding a free port: {e}"))?;
@@ -657,16 +694,27 @@ mod tests {
     }
 
     #[test]
-    fn bypass_produces_empty_pipeline() {
+    fn bypass_keeps_level_matching_preamp_and_omits_processing() {
         let dir = temp_dir("bypass");
         let mut dsp = DspSettings::default();
         dsp.crossfeed_enabled = true;
         dsp.preamp_db = -6.0;
         dsp.eq_bands = vec![EqBand::new("bell", 1000.0, 6.0, 1.0)];
+        let active_cfg = build_config(&io("pulse", false), &dsp, &dir).unwrap();
+        let active_gain = active_cfg["filters"]["preamp_gain"]["parameters"]["gain"]
+            .as_f64()
+            .unwrap();
+
         dsp.master_bypass = true;
-        let config = build_config(&io("pulse", false), &dsp, &dir).unwrap();
-        assert_eq!(config["pipeline"].as_array().unwrap().len(), 0);
-        assert!(config["filters"].as_object().unwrap().is_empty());
+        let bypass_cfg = build_config(&io("pulse", false), &dsp, &dir).unwrap();
+        let pipeline = bypass_cfg["pipeline"].as_array().unwrap();
+        assert_eq!(pipeline.len(), 1, "only level-matching preamp_gain remains: {pipeline:?}");
+        assert_eq!(pipeline[0]["names"], json!(["preamp_gain"]));
+        let bypass_gain = bypass_cfg["filters"]["preamp_gain"]["parameters"]["gain"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(bypass_gain, active_gain, "A/B bypass must match processed gain offset");
+        assert!(bypass_cfg["mixers"].as_object().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -748,6 +796,91 @@ mod tests {
         assert_eq!(alsa["devices"]["playback"]["type"], "Alsa");
         assert_eq!(alsa["devices"]["playback"]["format"], "S32_LE");
         assert!(build_config(&io("jack", false), &DspSettings::default(), &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hardware_playback_enables_rate_adjust_with_async_capture() {
+        let dir = temp_dir("rate-adjust");
+        let dsp = DspSettings::default();
+        for backend in ["alsa", "wasapi"] {
+            for rate in [48_000u32, 88_200] {
+                let mut route = io(backend, false);
+                route.sample_rate = rate;
+                let cfg = build_config(&route, &dsp, &dir).unwrap();
+                let devices = &cfg["devices"];
+                assert_eq!(devices["enable_rate_adjust"], json!(true), "{backend} {rate}");
+                assert_eq!(devices["target_level"], json!(route.chunk_size * 2), "{backend} {rate}");
+                assert_eq!(devices["adjust_period"], json!(3), "{backend} {rate}");
+                assert_eq!(devices["silence_timeout"], json!(0), "{backend} {rate}");
+                assert_eq!(devices["capture_samplerate"], json!(rate), "{backend} {rate}");
+                assert_eq!(devices["resampler"]["type"], json!("AsyncSinc"), "{backend} {rate}");
+                assert_eq!(devices["resampler"]["profile"], json!("Accurate"), "{backend} {rate}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pulse_playback_keeps_synchronous_resampling() {
+        let dir = temp_dir("pulse-rate");
+        let dsp = DspSettings::default();
+        let mut route = io("pulse", false);
+        for (rate, resampler) in [(88_200u32, "Synchronous"), (96_000, "Synchronous")] {
+            route.sample_rate = rate;
+            let cfg = build_config(&route, &dsp, &dir).unwrap();
+            assert_eq!(cfg["devices"]["enable_rate_adjust"], json!(false));
+            assert!(cfg["devices"].get("target_level").is_none());
+            assert_eq!(cfg["devices"]["capture_samplerate"], json!(rate));
+            assert_eq!(cfg["devices"]["resampler"]["type"], json!(resampler));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn composite_preamp_evaluates_crossfeed_and_eq_together() {
+        let dir = temp_dir("headroom");
+        let mut route = io("pulse", false);
+        route.sample_rate = 44_100;
+
+        // 1. Crossfeed alone (EQ disabled): preamp_gain reserves crossfeed headroom (~-3.84 dB).
+        let mut dsp = DspSettings::default();
+        dsp.crossfeed_enabled = true;
+        dsp.crossfeed_angle_deg = 60.0;
+        dsp.crossfeed_mid_boost_db = 3.0;
+        dsp.eq_enabled = false;
+        let cfg_cf_only = build_config(&route, &dsp, &dir).unwrap();
+        let cf_preamp = cfg_cf_only["filters"]["preamp_gain"]["parameters"]["gain"]
+            .as_f64()
+            .unwrap();
+        assert!(cf_preamp < -3.0 && cf_preamp > -4.5, "crossfeed-only preamp: {cf_preamp}");
+        let mapping = &cfg_cf_only["mixers"]["crossfeed_from_mid_side"]["mapping"];
+        assert_eq!(mapping[0]["sources"][0]["gain"], json!(0.0));
+        assert_eq!(mapping[1]["sources"][1]["inverted"], json!(true));
+
+        // 2. Non-overlapping +3.5 dB bass boost at 31 Hz (where crossfeed is ~0 dB)
+        // must NOT stack on top of the ~1.8 kHz crossfeed peak.
+        dsp.eq_enabled = true;
+        dsp.eq_bands = vec![EqBand::new("bell", 31.0, 3.5, 1.41)];
+        let cfg_non_overlap = build_config(&route, &dsp, &dir).unwrap();
+        let non_overlap_preamp = cfg_non_overlap["filters"]["preamp_gain"]["parameters"]["gain"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (non_overlap_preamp - cf_preamp).abs() < 0.25,
+            "non-overlapping bass EQ ({non_overlap_preamp}) should not double-penalize crossfeed ({cf_preamp})"
+        );
+
+        // 3. Overlapping +4.0 dB boost at 660 Hz (on top of the 60° crossfeed peak) MUST add.
+        dsp.eq_bands = vec![EqBand::new("bell", 660.0, 4.0, 1.41)];
+        let cfg_overlap = build_config(&route, &dsp, &dir).unwrap();
+        let overlap_preamp = cfg_overlap["filters"]["preamp_gain"]["parameters"]["gain"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            overlap_preamp < cf_preamp - 3.5,
+            "overlapping 660 Hz EQ ({overlap_preamp}) must add to crossfeed ({cf_preamp})"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

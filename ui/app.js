@@ -113,16 +113,31 @@
   function computePEQ(s) {
     const rate = dspSampleRate(s.sample_rate);
     const freq_hz = Array.from({length:280}, (_,i) => 20 * 1000**(i/279));
-    const per_band_db = s.eq_bands.map(band => {
-      const coeff = coefficients(band,rate);
-      return freq_hz.map(f => band.enabled ? responseAt(coeff,f,rate) : 0);
-    });
+    const bandCoeffs = s.eq_bands.map(band => ({enabled:band.enabled, coeff:coefficients(band,rate)}));
+    const per_band_db = bandCoeffs.map(({enabled,coeff}) =>
+      freq_hz.map(f => enabled ? responseAt(coeff,f,rate) : 0)
+    );
     const raw_db = freq_hz.map((_,i) => per_band_db.reduce((sum,values) => sum+values[i],0));
     const curve_peak_db = Math.max(0,...raw_db);
     const curve_preamp_db = s.preamp_db - (s.auto_preamp ? Math.max(0,curve_peak_db) : 0);
     const composite_db = raw_db.map(v => v + curve_preamp_db);
-    const raw_peak_db = s.eq_enabled ? curve_peak_db : 0;
-    const effective_preamp_db = (s.master_bypass || !s.eq_enabled) ? 0 : curve_preamp_db;
+
+    let chain_peak_db = s.eq_enabled ? curve_peak_db : 0;
+    const cf = s.crossfeed_enabled ? (previewMode ? computeCrossfeed(s) : crossPreview) : null;
+    if(s.crossfeed_enabled && cf?.freq_hz?.length) {
+      chain_peak_db = 0;
+      cf.freq_hz.forEach((f,i) => {
+        const mSq = 10**((cf.mid_db?.[i]??0)/10);
+        const sSq = 10**((cf.side_db?.[i]??0)/10);
+        const cfDb = 10*Math.log10(Math.max(1e-16, Math.max(mSq, 0.5*(mSq+sSq))));
+        const eqDb = s.eq_enabled ? bandCoeffs.reduce((sum,{enabled,coeff}) => sum+(enabled?responseAt(coeff,f,rate):0), 0) : 0;
+        if(cfDb + eqDb > chain_peak_db) chain_peak_db = cfDb + eqDb;
+      });
+    }
+    const raw_peak_db = chain_peak_db;
+    const effective_preamp_db = (!s.eq_enabled && !s.crossfeed_enabled)
+      ? 0
+      : s.preamp_db - (s.auto_preamp ? Math.max(0,raw_peak_db) : 0);
     return {freq_hz,per_band_db,composite_db,raw_peak_db,effective_preamp_db};
   }
   function fitGeq(target,rate) {
@@ -167,7 +182,7 @@
     return {running:mockRunning,state:mockRunning?'Running':'Stopped',sample_rate:mockSettings.sample_rate,chunksize:mockSettings.chunksize,capture_peak:input,playback_peak:output,capture_rms:input.map(v=>v-8),playback_rms:output.map(v=>v-8),load_percent:mockRunning?2.4+Math.sin(Date.now()/1500)*.5:0,clipped_samples:mockClips,error:null};
   }
   function mockResponse() {
-    return {settings:clone(mockSettings),capture_devices:[{id:'headphone_dsp_sink.monitor',label:'[Virtual Sink Loopback] Headphone DSP Virtual Input',backend:'Pulse',is_loopback:true,channels:2}],playback_devices:[{id:'plughw:CARD=Generic_1,DEV=0',label:'ALC257 Analog (ALSA Direct)',backend:'Alsa',is_loopback:false,channels:2},{id:'default',label:'System default output',backend:'Pulse',is_loopback:false,channels:2}],profiles:Object.keys(mockProfiles),peq_preview:computePEQ(mockSettings),crossfeed_preview:computeCrossfeed(mockSettings),meters:mockMeters()};
+    return {settings:clone(mockSettings),capture_devices:[{id:'headphone_dsp_sink.monitor',label:'[Virtual Sink Loopback] HeadphoneDSP',backend:'Pulse',is_loopback:true,channels:2}],playback_devices:[{id:'plughw:CARD=Generic_1,DEV=0',label:'ALC257 Analog (ALSA Direct)',backend:'Alsa',is_loopback:false,channels:2},{id:'default',label:'System default output',backend:'Pulse',is_loopback:false,channels:2}],profiles:Object.keys(mockProfiles),peq_preview:computePEQ(mockSettings),crossfeed_preview:computeCrossfeed(mockSettings),meters:mockMeters()};
   }
   function persistProfiles() {
     try { localStorage.setItem(storageKey,JSON.stringify(mockProfiles)); }
@@ -363,7 +378,7 @@
               sampleRate:settings.sample_rate,
               enabled:settings.crossfeed_enabled
             });
-            if(rev===crossRevision) { crossPreview=preview; renderCross(preview); }
+            if(rev===crossRevision) { crossPreview=preview; renderCross(preview); renderEQ(computePEQ(settings)); }
           } catch { /* Ignore transient preview errors; retain the last real curve. */ }
           if(rev===crossRevision) break;
         }
@@ -636,6 +651,11 @@
     if(previewMode) return;
     event.preventDefault();
     invoke('open_external_url', { url: 'https://autoeq.app' }).catch(report);
+  });
+  $('camilla-gui').addEventListener('click',()=>{
+    $('camilla-gui').blur();
+    if(previewMode) { window.open('http://127.0.0.1:5005','_blank','noopener,noreferrer'); return; }
+    invoke('open_external_url', { url: 'http://127.0.0.1:5005' }).catch(report);
   });
   $('export').addEventListener('click',async()=>{
     $('export').disabled=true;

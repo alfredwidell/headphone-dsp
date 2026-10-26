@@ -12,7 +12,9 @@ use num_complex::Complex64;
 use realfft::RealFftPlanner;
 use serde::{Deserialize, Serialize};
 
-use crate::peq::{log_frequency_grid, CURVE_POINTS, FREQ_MAX_HZ, FREQ_MIN_HZ};
+use crate::peq::{
+    biquad_coefficients, log_frequency_grid, Biquad, EqBand, CURVE_POINTS, FREQ_MAX_HZ, FREQ_MIN_HZ,
+};
 
 pub const DEFAULT_CROSSFEED_ANGLE_DEG: f64 = 30.0;
 pub const MIN_CROSSFEED_ANGLE_DEG: f64 = 0.0;
@@ -308,6 +310,69 @@ pub fn build_ms_side_filter_taps(
     mid_side_pair(angle_deg, sample_rate, tap_count, mid_boost_db).1
 }
 
+/// Headroom (dB, zero or negative) that keeps the crossfeed output from
+/// clipping when no EQ bands are active.
+pub fn crossfeed_headroom_db(mid_taps: &[f64], side_taps: &[f64]) -> f64 {
+    composite_chain_headroom_db(Some((mid_taps, side_taps)), &[], 48_000)
+}
+
+/// Headroom (dB, zero or negative) for the series cascade of the Mid/Side
+/// crossfeed FIR pair and the active biquad EQ bands. Evaluates the combined
+/// frequency response bin-by-bin (`G_cf^2(f) * |H_eq(f)|^2`) so non-overlapping
+/// boosts (e.g. a low-bass EQ shelf and a 2 kHz crossfeed notch correction)
+/// are not penalised twice, while overlapping boosts add accurately.
+pub fn composite_chain_headroom_db(
+    crossfeed_taps: Option<(&[f64], &[f64])>,
+    enabled_bands: &[EqBand],
+    sample_rate: u32,
+) -> f64 {
+    let fs = sample_rate.max(1) as f64;
+    let biquads: Vec<Biquad> = enabled_bands
+        .iter()
+        .map(|b| biquad_coefficients(b, fs))
+        .collect();
+    let eq_gain_sq = |freq_hz: f64| -> f64 {
+        biquads
+            .iter()
+            .fold(1.0_f64, |acc, bq| acc * bq.response(freq_hz, fs).norm_sqr())
+    };
+
+    let mut max_sq = 0.0_f64;
+    if let Some((mid_taps, side_taps)) = crossfeed_taps {
+        let base_len = mid_taps.len().max(side_taps.len()).max(2);
+        let n = (base_len * 4).max(8192);
+        let mut planner = RealFftPlanner::<f64>::new();
+        let forward = planner.plan_fft_forward(n);
+        let spectrum = |taps: &[f64]| -> Vec<Complex64> {
+            let mut input = vec![0.0; n];
+            input[..taps.len()].copy_from_slice(taps);
+            let mut output = forward.make_output_vec();
+            forward
+                .process(&mut input, &mut output)
+                .expect("forward FFT buffers are sized by construction");
+            output
+        };
+        let mid = spectrum(mid_taps);
+        let side = spectrum(side_taps);
+
+        for (k, (m, s)) in mid.iter().zip(side.iter()).enumerate() {
+            let freq_hz = k as f64 * fs / n as f64;
+            let mid_sq = m.norm_sqr();
+            let side_sq = s.norm_sqr();
+            let cf_sq = mid_sq.max(0.5 * (mid_sq + side_sq));
+            let total_sq = cf_sq * eq_gain_sq(freq_hz);
+            max_sq = max_sq.max(total_sq);
+        }
+    } else if !biquads.is_empty() {
+        for freq_hz in log_frequency_grid(CURVE_POINTS, FREQ_MIN_HZ, FREQ_MAX_HZ) {
+            max_sq = max_sq.max(eq_gain_sq(freq_hz));
+        }
+    }
+
+    let peak_db = if max_sq > 1e-24 { 10.0 * max_sq.log10() } else { 0.0 };
+    (-peak_db).min(0.0)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FirMatrix {
     /// ipsi: (mid + side) / 2 (also used for rr)
@@ -517,5 +582,19 @@ mod tests {
         let parsed: Vec<f64> = lines.map(|l| l.parse().unwrap()).collect();
         assert_eq!(parsed, taps);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crossfeed_headroom_is_negative_and_tracks_mid_boost() {
+        let headroom = |boost: f64| {
+            let mid = build_ms_mid_filter_taps(60.0, 44_100, 2048, boost);
+            let side = build_ms_side_filter_taps(60.0, 44_100, 2048, boost);
+            crossfeed_headroom_db(&mid, &side)
+        };
+        let at_3db = headroom(3.0);
+        let at_9db = headroom(9.0);
+        assert!(at_3db > -4.5 && at_3db < -3.0, "3 dB boost headroom: {at_3db}");
+        assert!(at_9db < at_3db, "9 dB boost ({at_9db}) must need more headroom than 3 dB ({at_3db})");
+        assert!(headroom(0.0) <= 0.0, "headroom is never positive");
     }
 }

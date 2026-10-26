@@ -11,13 +11,14 @@ Standalone desktop **Crossfeed + 10-Band Graphic EQ** headphone processor for **
 - **10-Band AutoEQ Graphic Equalizer (`Q = 1.41`)**:
   - ISO octave centers (`31, 62, 125, 250, 500, 1k, 2k, 4k, 8k, 16k Hz`) with constant `Q = 1.41` peaking biquads, matching AutoEQ's 10-band Fixed-Band EQ.
   - Interactive frequency-response graph (20 Hz – 20 kHz) with vertical-drag band handles plus a 10-channel studio vertical fader bank (drag, mousewheel, keyboard, numeric input, and double-click to reset).
-  - **Automatic Anti-Clip Preamp**: Integrated directly into the Graphic EQ — automatically attenuates by the peak positive EQ boost (`min(-raw_peak_db, 0)`) so the composite curve never exceeds `0 dB`.
+  - **Composite Automatic Anti-Clip Preamp**: Evaluates the combined frequency response of the active KU100 Mid/Side Crossfeed FIR filters and 10-band Graphic EQ (`composite_chain_headroom_db`) bin-by-bin across frequency and attenuates by the composite peak (`min(-raw_peak_db, 0)`) so non-overlapping boosts are not double-penalized while the output never exceeds `0 dB`.
   - **Headphone Profiles & AutoEQ Import/Export**: Save/load named headphone profiles and import/export AutoEQ presets (supports 10-band Fixed-Band EQ directly, and automatically fits arbitrary AutoEQ Parametric / GraphicEQ curves onto the 10 bands).
 - **Zero-Driver Loopback Capture**:
   - **Windows (Option 1 — Zero-driver WASAPI Loopback)**: Captures system audio from a Windows playback endpoint via CamillaDSP's native `Wasapi` `loopback: true` capture mode and outputs to your headphone DAC via `Wasapi` (shared or exclusive mode).
-  - **Linux (PipeWire / PulseAudio + ALSA)**: Automatically creates a `"Headphone DSP Virtual Input"` sink (`headphone_dsp_sink`) on startup, captures from `headphone_dsp_sink.monitor`, and outputs directly to your hardware DAC via ALSA or PipeWire/PulseAudio.
-- **Live Signal Meters & Instant A/B Bypass**:
+  - **Linux (PipeWire / PulseAudio + ALSA)**: Automatically creates a `"HeadphoneDSP"` sink (`headphone_dsp_sink`) on startup, captures from `headphone_dsp_sink.monitor`, and outputs directly to your hardware DAC via ALSA or PipeWire/PulseAudio.
+- **Live Signal Meters & Level-Matched A/B Bypass**:
   - Real-time input/output stereo peak & RMS meters, DSP processing load, and clipped-sample counter over CamillaDSP's local WebSocket control port.
+  - **`A / B` Bypass** bypasses the Crossfeed and Graphic EQ filters while keeping the active `preamp_gain` offset so unprocessed vs. processed comparisons stay level-matched without volume jumps.
 
 ## Repository Layout
 

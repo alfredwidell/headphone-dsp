@@ -384,30 +384,31 @@ async fn stop_engine(state: tauri::State<'_, AppState>) -> Result<AppStateRespon
 async fn get_live_meters(state: tauri::State<'_, AppState>) -> Result<LiveMeters, String> {
     let mut core = state.core.lock().await;
     core.rate_poll_ticks = core.rate_poll_ticks.wrapping_add(1);
-    #[cfg(target_os = "linux")]
-    if core.settings.hw_volume_bypass {
-        if crate::devices::read_linux_virtual_sink_volume() != Some(100) {
-            crate::devices::set_linux_virtual_sink_volume(100);
-        }
-    } else if let Some(vol) = crate::devices::read_linux_virtual_sink_volume() {
-        if core.settings.virtual_sink_volume != Some(vol) {
-            core.settings.virtual_sink_volume = Some(vol);
-            let _ = core.store.save_settings(&core.settings);
-        }
-    }
-    if core.engine.is_running() && core.rate_poll_ticks % 10 == 0 {
+    if core.rate_poll_ticks % 10 == 0 {
+        let running = core.engine.is_running();
         let route = route_of(&core.settings);
         drop(core);
-        let detected = detect_rate_async(route.0.clone(), route.1.clone()).await;
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let (volume, rate) = poll_audio_blocking(route.clone(), running).await;
         core = state.core.lock().await;
-        if let Some(new_rate) = detected {
-            if core.engine.is_running()
-                && route_of(&core.settings) == route
-                && new_rate != core.settings.sample_rate
-            {
-                core.settings.sample_rate = new_rate;
-                let _ = core.save();
-                let _ = core.launch().await;
+        #[cfg(target_os = "linux")]
+        if core.settings.hw_volume_bypass {
+            if volume.is_some() && volume != Some(100) {
+                crate::devices::set_linux_virtual_sink_volume(100);
+            }
+        } else if let Some(vol) = volume {
+            if core.settings.virtual_sink_volume != Some(vol) {
+                core.settings.virtual_sink_volume = Some(vol);
+                let _ = core.store.save_settings(&core.settings);
+            }
+        }
+        if core.engine.is_running() && route_of(&core.settings) == route {
+            if let Some(new_rate) = rate {
+                if new_rate != core.settings.sample_rate {
+                    core.settings.sample_rate = new_rate;
+                    let _ = core.save();
+                    let _ = core.launch().await;
+                }
             }
         }
     }
@@ -415,6 +416,36 @@ async fn get_live_meters(state: tauri::State<'_, AppState>) -> Result<LiveMeters
     meters.sample_rate = core.settings.sample_rate;
     meters.chunksize = core.settings.chunksize;
     Ok(meters)
+}
+
+/// Blocking part of the periodic poll (every ~2 s), run off the async runtime
+/// and never while the core lock is held: the Linux virtual-sink volume
+/// (`pactl`) and, while the engine runs, the source sample rate.
+async fn poll_audio_blocking(
+    route: (String, String),
+    check_rate: bool,
+) -> (Option<u8>, Option<u32>) {
+    tokio::task::spawn_blocking(move || {
+        let volume = linux_volume_poll();
+        let rate = if check_rate {
+            crate::devices::detect_source_sample_rate(&route.0, &route.1)
+        } else {
+            None
+        };
+        (volume, rate)
+    })
+    .await
+    .unwrap_or((None, None))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_volume_poll() -> Option<u8> {
+    crate::devices::read_linux_virtual_sink_volume()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_volume_poll() -> Option<u8> {
+    None
 }
 
 /// Save the current DSP settings as a named profile and make it active. The
@@ -539,14 +570,17 @@ async fn get_crossfeed_preview(
     .map_err(|e| format!("crossfeed preview failed: {e}"))
 }
 
-/// Origin of the only external link the app opens: the AutoEQ headphone search.
+/// Permitted external browser origins: AutoEQ preset search and the local
+/// CamillaDSP web interface (`camillagui`).
 const AUTOEQ_ORIGIN: &str = "https://autoeq.app";
+const CAMILLAGUI_ORIGIN: &str = "http://127.0.0.1:5005";
 
-/// True for `https://autoeq.app` and paths under it, with no whitespace,
+/// True for permitted origins and paths under them, with no whitespace,
 /// control characters, or shell metacharacters. The Windows launcher runs the
 /// URL through `cmd`, where those characters would split or extend the command.
 fn is_permitted_external_url(url: &str) -> bool {
-    let origin_ok = url == AUTOEQ_ORIGIN || url.starts_with(&format!("{AUTOEQ_ORIGIN}/"));
+    let matches_origin = |origin: &str| url == origin || url.starts_with(&format!("{origin}/"));
+    let origin_ok = matches_origin(AUTOEQ_ORIGIN) || matches_origin(CAMILLAGUI_ORIGIN);
     origin_ok
         && url
             .chars()
@@ -716,8 +750,11 @@ mod tests {
     fn autoeq_links_are_the_only_permitted_external_urls() {
         assert!(is_permitted_external_url("https://autoeq.app"));
         assert!(is_permitted_external_url("https://autoeq.app/?q=hd650"));
+        assert!(is_permitted_external_url("http://127.0.0.1:5005"));
+        assert!(is_permitted_external_url("http://127.0.0.1:5005/gui/index.html"));
         assert!(!is_permitted_external_url("http://autoeq.app"));
         assert!(!is_permitted_external_url("https://autoeq.app.example/"));
+        assert!(!is_permitted_external_url("http://127.0.0.1:50050"));
     }
 
     #[test]
