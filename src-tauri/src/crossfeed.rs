@@ -317,10 +317,12 @@ pub fn crossfeed_headroom_db(mid_taps: &[f64], side_taps: &[f64]) -> f64 {
 }
 
 /// Headroom (dB, zero or negative) for the series cascade of the Mid/Side
-/// crossfeed FIR pair and the active biquad EQ bands. Evaluates the combined
-/// frequency response bin-by-bin (`G_cf^2(f) * |H_eq(f)|^2`) so non-overlapping
-/// boosts (e.g. a low-bass EQ shelf and a 2 kHz crossfeed notch correction)
-/// are not penalised twice, while overlapping boosts add accurately.
+/// crossfeed FIR pair and the active biquad EQ bands, evaluated in the
+/// complex frequency domain:
+///   H_ll(f) = 0.5 * (H_mid(f) + H_side(f))
+///   H_lr(f) = 0.5 * (H_mid(f) - H_side(f))
+///   H_eq(f) = product_b H_biquad_b(f)
+///   G_worst(f) = |(H_ll(f) * H_eq(f))| + |(H_lr(f) * H_eq(f))|
 pub fn composite_chain_headroom_db(
     crossfeed_taps: Option<(&[f64], &[f64])>,
     enabled_bands: &[EqBand],
@@ -331,13 +333,13 @@ pub fn composite_chain_headroom_db(
         .iter()
         .map(|b| biquad_coefficients(b, fs))
         .collect();
-    let eq_gain_sq = |freq_hz: f64| -> f64 {
+    let eq_complex = |freq_hz: f64| -> Complex64 {
         biquads
             .iter()
-            .fold(1.0_f64, |acc, bq| acc * bq.response(freq_hz, fs).norm_sqr())
+            .fold(Complex64::new(1.0, 0.0), |acc, bq| acc * bq.response(freq_hz, fs))
     };
 
-    let mut max_sq = 0.0_f64;
+    let mut max_amp = 0.0_f64;
     if let Some((mid_taps, side_taps)) = crossfeed_taps {
         let base_len = mid_taps.len().max(side_taps.len()).max(2);
         let n = (base_len * 4).max(8192);
@@ -355,21 +357,21 @@ pub fn composite_chain_headroom_db(
         let mid = spectrum(mid_taps);
         let side = spectrum(side_taps);
 
-        for (k, (m, s)) in mid.iter().zip(side.iter()).enumerate() {
+        for (k, (&m, &s)) in mid.iter().zip(side.iter()).enumerate() {
             let freq_hz = k as f64 * fs / n as f64;
-            let mid_sq = m.norm_sqr();
-            let side_sq = s.norm_sqr();
-            let cf_sq = mid_sq.max(side_sq);
-            let total_sq = cf_sq * eq_gain_sq(freq_hz);
-            max_sq = max_sq.max(total_sq);
+            let h_ll = 0.5 * (m + s);
+            let h_lr = 0.5 * (m - s);
+            let h_eq = eq_complex(freq_hz);
+            let total_amp = (h_ll * h_eq).norm() + (h_lr * h_eq).norm();
+            max_amp = max_amp.max(total_amp);
         }
     } else if !biquads.is_empty() {
         for freq_hz in log_frequency_grid(CURVE_POINTS, FREQ_MIN_HZ, FREQ_MAX_HZ) {
-            max_sq = max_sq.max(eq_gain_sq(freq_hz));
+            max_amp = max_amp.max(eq_complex(freq_hz).norm());
         }
     }
 
-    let peak_db = if max_sq > 1e-24 { 10.0 * max_sq.log10() } else { 0.0 };
+    let peak_db = if max_amp > 1e-12 { 20.0 * max_amp.log10() } else { 0.0 };
     (-peak_db).min(0.0)
 }
 
