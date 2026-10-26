@@ -359,7 +359,7 @@ pub fn composite_chain_headroom_db(
             let freq_hz = k as f64 * fs / n as f64;
             let mid_sq = m.norm_sqr();
             let side_sq = s.norm_sqr();
-            let cf_sq = mid_sq.max(0.5 * (mid_sq + side_sq));
+            let cf_sq = mid_sq.max(side_sq);
             let total_sq = cf_sq * eq_gain_sq(freq_hz);
             max_sq = max_sq.max(total_sq);
         }
@@ -591,10 +591,12 @@ mod tests {
             let side = build_ms_side_filter_taps(60.0, 44_100, 2048, boost);
             crossfeed_headroom_db(&mid, &side)
         };
+        let at_0db = headroom(0.0);
         let at_3db = headroom(3.0);
         let at_9db = headroom(9.0);
-        assert!(at_3db > -4.5 && at_3db < -3.0, "3 dB boost headroom: {at_3db}");
+        assert!(at_0db < -3.0 && at_0db > -4.5, "0 dB boost headroom: {at_0db}");
+        assert!(at_3db < -6.0 && at_3db > -7.0, "3 dB boost headroom: {at_3db}");
         assert!(at_9db < at_3db, "9 dB boost ({at_9db}) must need more headroom than 3 dB ({at_3db})");
-        assert!(headroom(0.0) <= 0.0, "headroom is never positive");
+        assert!(at_0db <= 0.0, "headroom is never positive");
     }
 }

@@ -127,9 +127,7 @@
     if(s.crossfeed_enabled && cf?.freq_hz?.length) {
       chain_peak_db = 0;
       cf.freq_hz.forEach((f,i) => {
-        const mSq = 10**((cf.mid_db?.[i]??0)/10);
-        const sSq = 10**((cf.side_db?.[i]??0)/10);
-        const cfDb = 10*Math.log10(Math.max(1e-16, Math.max(mSq, 0.5*(mSq+sSq))));
+        const cfDb = Math.max(cf.mid_db?.[i]??0, cf.side_db?.[i]??0);
         const eqDb = s.eq_enabled ? bandCoeffs.reduce((sum,{enabled,coeff}) => sum+(enabled?responseAt(coeff,f,rate):0), 0) : 0;
         if(cfDb + eqDb > chain_peak_db) chain_peak_db = cfDb + eqDb;
       });

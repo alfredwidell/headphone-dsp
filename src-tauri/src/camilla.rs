@@ -843,7 +843,7 @@ mod tests {
         let mut route = io("pulse", false);
         route.sample_rate = 44_100;
 
-        // 1. Crossfeed alone (EQ disabled): preamp_gain reserves crossfeed headroom (~-3.84 dB).
+        // 1. Crossfeed alone (EQ disabled): preamp_gain reserves full Side filter peak headroom (~-6.49 dB).
         let mut dsp = DspSettings::default();
         dsp.crossfeed_enabled = true;
         dsp.crossfeed_angle_deg = 60.0;
@@ -853,7 +853,7 @@ mod tests {
         let cf_preamp = cfg_cf_only["filters"]["preamp_gain"]["parameters"]["gain"]
             .as_f64()
             .unwrap();
-        assert!(cf_preamp < -3.0 && cf_preamp > -4.5, "crossfeed-only preamp: {cf_preamp}");
+        assert!(cf_preamp < -6.0 && cf_preamp > -7.0, "crossfeed-only preamp: {cf_preamp}");
         let mapping = &cfg_cf_only["mixers"]["crossfeed_from_mid_side"]["mapping"];
         assert_eq!(mapping[0]["sources"][0]["gain"], json!(0.0));
         assert_eq!(mapping[1]["sources"][1]["inverted"], json!(true));
