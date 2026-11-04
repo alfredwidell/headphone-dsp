@@ -79,6 +79,11 @@ fn capture_device(io: &IoConfig) -> Result<Value, String> {
 }
 
 /// CamillaDSP `devices.playback` block. Playback is always stereo.
+///
+/// For `Alsa`, `format` is intentionally omitted: CamillaDSP 4.1.3 queries the
+/// ALSA device's supported formats (`[S16_LE, S24_3_LE, S32_LE, ...]`), picks
+/// the highest-precision native format (e.g. `S24_3_LE` on 24-bit USB DACs),
+/// and converts internally from its 64-bit float pipeline.
 fn playback_device(io: &IoConfig) -> Result<Value, String> {
     let device = &io.playback;
     let backend = canonical_backend(&device.backend)
@@ -99,8 +104,7 @@ fn playback_device(io: &IoConfig) -> Result<Value, String> {
         _ => Ok(json!({
             "type": "Alsa",
             "channels": 2,
-            "device": device.id,
-            "format": "S32_LE"
+            "device": device.id
         })),
     }
 }
@@ -794,7 +798,7 @@ mod tests {
         assert_eq!(wasapi["devices"]["playback"]["format"], "F32_LE");
         let alsa = build_config(&io("alsa", false), &DspSettings::default(), &dir).unwrap();
         assert_eq!(alsa["devices"]["playback"]["type"], "Alsa");
-        assert_eq!(alsa["devices"]["playback"]["format"], "S32_LE");
+        assert!(alsa["devices"]["playback"].get("format").is_none());
         assert!(build_config(&io("jack", false), &DspSettings::default(), &dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
